@@ -24,7 +24,7 @@ MarkupSafe==3.0.3
 networkx==3.6.1
 numpy==2.4.4
 opencv-contrib-python==4.13.0.92
-opencv-python
+opencv-python 
 opencv-python-headless==4.13.0.92
 opt-einsum==3.3.0
 packaging==26.2
@@ -60,3 +60,4 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.7.0
 uvicorn==0.42.0
+openpyxl

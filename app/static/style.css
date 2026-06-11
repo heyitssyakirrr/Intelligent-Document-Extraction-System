@@ -794,10 +794,10 @@ app.summary-table tr:last-child td { border-bottom: none; }
     gap: 16px;
 }
 
-/* Two-column grid inside each batch result card */
+/* Full-width layout inside each batch result card */
 .batch-fields-row {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr;
     gap: 20px;
     align-items: start;
     width: 100%;

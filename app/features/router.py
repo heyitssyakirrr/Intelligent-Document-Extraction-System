@@ -179,43 +179,134 @@ _AUDIT_FIELDS = [
 
 
 def _write_audit_csv(records: list[dict]) -> None:
-    """Write one audit CSV per batch run to audit_logs/. Never exposed via HTTP."""
-    import csv
+    """Write one audit XLSX per batch run to audit_logs/ with colour-coded expected columns."""
     from datetime import datetime
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = _AUDIT_DIR / f"audit_{timestamp}.csv"
+    path = _AUDIT_DIR / f"audit_{timestamp}.xlsx"
 
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Audit"
+
+    # --- Styles ---
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    green_font = Font(color="006100")
+    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    red_font = Font(color="9C0006")
+    total_font = Font(bold=True, size=11)
+    thin_border = Border(
+        left=Side(style="thin", color="D9D9D9"),
+        right=Side(style="thin", color="D9D9D9"),
+        top=Side(style="thin", color="D9D9D9"),
+        bottom=Side(style="thin", color="D9D9D9"),
+    )
+
+    # --- Header row ---
     header = ["File Name"]
     for _key, label in _AUDIT_FIELDS:
         header += [f"Extracted {label}", f"Expected {label}"]
+    header.append("Accurate Count")
 
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(header)
+    ws.append(header)
+    for col_idx, _ in enumerate(header, start=1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = thin_border
 
-        for record in records:
-            filename     = record.get("filename", "")
-            extract_res  = record.get("extractResult") or {}
-            extract_err  = record.get("extractError")
+    # --- Data rows ---
+    total_accurate = 0
+    total_fields = 0
 
-            if extract_err or not extract_res:
-                row = [filename] + ["ERROR", ""] * len(_AUDIT_FIELDS)
-                writer.writerow(row)
-                continue
+    # Track which columns are "Expected" so we can colour them
+    # Expected columns are at indices: 3, 5, 7, 9 (1-based) i.e. every even field col
+    expected_col_indices = [2 + i * 2 + 1 for i in range(len(_AUDIT_FIELDS))]  # 1-based: 3,5,7,9
 
-            data = extract_res.get("data") or {}
-            cmp  = extract_res.get("comparison") or {}
+    for record in records:
+        filename    = record.get("filename", "")
+        extract_res = record.get("extractResult") or {}
+        extract_err = record.get("extractError")
 
-            row = [filename]
-            for key, _label in _AUDIT_FIELDS:
-                extracted = data.get(key) or ""
-                expected  = (cmp.get(key) or {}).get("expected") or ""
-                row += [extracted, expected]
+        if extract_err or not extract_res:
+            row_data = [filename] + ["ERROR", ""] * len(_AUDIT_FIELDS) + [0]
+            ws.append(row_data)
+            row_num = ws.max_row
+            for col_idx in range(1, len(row_data) + 1):
+                ws.cell(row=row_num, column=col_idx).border = thin_border
+            for col_idx in expected_col_indices:
+                cell = ws.cell(row=row_num, column=col_idx)
+                cell.fill = red_fill
+                cell.font = red_font
+            total_fields += len(_AUDIT_FIELDS)
+            continue
 
-            writer.writerow(row)
+        data = extract_res.get("data") or {}
+        cmp  = extract_res.get("comparison") or {}
 
-    logger.info("Audit log saved: %s (%d record(s))", path, len(records))
+        row_data = [filename]
+        matches = []
+        accurate_count = 0
+        for key, _label in _AUDIT_FIELDS:
+            extracted = (data.get(key) or "").strip()
+            expected  = ((cmp.get(key) or {}).get("expected") or "").strip()
+            row_data += [extracted, expected]
+            is_match = bool(extracted and expected and extracted == expected)
+            matches.append(is_match)
+            if is_match:
+                accurate_count += 1
+
+        row_data.append(accurate_count)
+        total_accurate += accurate_count
+        total_fields += len(_AUDIT_FIELDS)
+        ws.append(row_data)
+
+        row_num = ws.max_row
+        for col_idx in range(1, len(row_data) + 1):
+            ws.cell(row=row_num, column=col_idx).border = thin_border
+
+        # Colour expected columns green/red
+        for i, col_idx in enumerate(expected_col_indices):
+            cell = ws.cell(row=row_num, column=col_idx)
+            if matches[i]:
+                cell.fill = green_fill
+                cell.font = green_font
+            else:
+                cell.fill = red_fill
+                cell.font = red_font
+
+    # --- Summary row ---
+    if total_fields > 0:
+        pct = (total_accurate / total_fields) * 100
+    else:
+        pct = 0.0
+
+    summary_row = ["TOTAL"] + [""] * (len(_AUDIT_FIELDS) * 2)
+    summary_row.append(f"{total_accurate}/{total_fields} ({pct:.2f}%)")
+    ws.append(summary_row)
+    row_num = ws.max_row
+    for col_idx in range(1, len(summary_row) + 1):
+        cell = ws.cell(row=row_num, column=col_idx)
+        cell.font = total_font
+        cell.border = thin_border
+
+    # --- Auto-fit column widths ---
+    for col in ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            if cell.value:
+                max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[col_letter].width = min(max_len + 4, 40)
+
+    wb.save(str(path))
+    logger.info("Audit log saved: %s (%d record(s), accuracy %.2f%%)", path, len(records), pct if total_fields else 0.0)
 
 
 @router.post("/audit-log", include_in_schema=False)

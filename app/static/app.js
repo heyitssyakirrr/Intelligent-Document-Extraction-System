@@ -429,12 +429,8 @@ document.addEventListener("DOMContentLoaded", function () {
                         setPillStatus(item.statusEl, "error", "LLM Error");
                     } else {
                         item.extractResult = obj.data;
-                        var cmp      = obj.data.comparison;
-                        var allMatch = cmp && cmp.all_match;
-                        var csvFound = cmp && cmp.csv_row_found;
-                        var status   = !csvFound ? "warn" : (allMatch ? "pass" : "fail");
-                        item.extractStatus = status;
-                        fillResultCard(card, obj.data, status);
+                        item.extractStatus = "done";
+                        fillResultCard(card, obj.data);
                         setPillStatus(item.statusEl, "done", "Done");
                     }
                 })
@@ -471,8 +467,7 @@ document.addEventListener("DOMContentLoaded", function () {
                 '<td class="col-name">' + escHtml(originalName) +
                 (errorMsg ? '<div style="font-size:11px;color:var(--pb-error);">' + escHtml(errorMsg) + '</div>' : '') +
                 '</td>' +
-                '<td class="col-status">' + statusCell + '</td>' +
-                '<td class="col-action">' + actionCell + '</td>';
+                '<td class="col-status">' + statusCell + '</td>';
             ocrTableBody.appendChild(tr);
         }
 
@@ -535,18 +530,14 @@ document.addEventListener("DOMContentLoaded", function () {
             card.bodyContent.innerHTML = '<span style="font-size:13px;color:var(--pb-error);">&#10007; ' + escHtml(msg) + '</span>';
         }
 
-        function fillResultCard(card, result, statusStr) {
-            var badgeLabels = { pass: "\u2713 All Match", fail: "\u2717 Mismatch", warn: "\u26A0 No Reference" };
-            var badgeClass  = { pass: "pass", fail: "fail", warn: "warn" };
-            card.badge.className = "batch-result-badge batch-result-badge--" + (badgeClass[statusStr] || "warn");
-            card.badge.textContent = badgeLabels[statusStr] || "Done";
+        function fillResultCard(card, result) {
+            card.badge.className = "batch-result-badge batch-result-badge--pass";
+            card.badge.textContent = "Done";
 
             var d = result.data || {};
 
             function fieldVal(key) {
                 if (d[key] != null && d[key] !== "") return d[key];
-                if (result.comparison && result.comparison[key] && result.comparison[key].extracted != null)
-                    return result.comparison[key].extracted;
                 return null;
             }
 
@@ -559,52 +550,15 @@ document.addEventListener("DOMContentLoaded", function () {
             var fieldsHtml =
                 '<div class="results-card" style="flex:1;border:none;padding:0;">' +
                 '<span class="section-label" style="display:block;margin-bottom:12px;">Extracted Fields</span>' +
+                '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0;">' +
                 fieldHtml("Bank Name",          fieldVal("bank_name")) +
                 fieldHtml("Customer Name",      fieldVal("name")) +
                 fieldHtml("Master Account No.", fieldVal("master_account_number")) +
                 fieldHtml("Sub Account No.",    fieldVal("sub_account_number")) +
                 fieldHtml("FI Number",          fieldVal("fi_num")) +
-                '</div>';
+                '</div></div>';
 
-            var cmpHtml = buildComparisonHtml(result.comparison);
-            card.bodyContent.innerHTML = '<div class="batch-fields-row">' + fieldsHtml + cmpHtml + '</div>';
-        }
-
-        function buildComparisonHtml(comparison) {
-            if (!comparison) return "";
-            var LABELS = {
-                bank_name: "Bank Name", fi_num: "FI Number",
-                master_account_number: "Master Account No.", sub_account_number: "Sub Account No.",
-            };
-            var html = '<div style="flex:1;border:none;padding:0;">' +
-                '<span class="section-label" style="display:block;margin-bottom:12px;">Verification</span>';
-
-            if (!comparison.csv_row_found) {
-                html += '<div class="cmp-badge cmp-badge--warn">&#9888; Not in reference data</div>';
-            } else if (comparison.all_match) {
-                html += '<div class="cmp-badge cmp-badge--pass">&#10003; All fields match</div>';
-            } else {
-                html += '<div class="cmp-badge cmp-badge--fail">&#10007; Mismatch detected</div>';
-            }
-
-            html += '<div class="cmp-table-wrap"><table class="cmp-table"><thead><tr>' +
-                '<th>Field</th><th>Extracted</th><th>Expected</th><th></th></tr></thead><tbody>';
-
-            ["bank_name", "fi_num", "master_account_number", "sub_account_number"].forEach(function (key) {
-                var detail = comparison[key];
-                if (!detail) return;
-                var icon, cls;
-                if (!comparison.csv_row_found) { icon = "&#9888;"; cls = "cmp-warn"; }
-                else { icon = detail.match ? "&#10003;" : "&#10007;"; cls = detail.match ? "cmp-pass" : "cmp-fail"; }
-                html += '<tr class="' + cls + '">' +
-                    '<td class="cmp-field-name">' + LABELS[key] + '</td>' +
-                    '<td>' + escHtml(detail.extracted || "\u2014") + '</td>' +
-                    '<td>' + escHtml(detail.expected  || "\u2014") + '</td>' +
-                    '<td class="cmp-status">' + icon + '</td></tr>';
-            });
-
-            html += '</tbody></table></div></div>';
-            return html;
+            card.bodyContent.innerHTML = fieldsHtml;
         }
 
         // ---- progress ----
@@ -680,20 +634,13 @@ document.addEventListener("DOMContentLoaded", function () {
                 }
 
                 var d = item.extractResult.data || {};
-                var cmp = item.extractResult.comparison || null;
-
-                function getVal(key) {
-                    if (d[key] != null && d[key] !== "") return d[key];
-                    if (cmp && cmp[key] && cmp[key].extracted != null) return cmp[key].extracted;
-                    return "";
-                }
 
                 rows.push(csvRow([
                     filename,
-                    getVal("bank_name"),
-                    getVal("fi_num"),
-                    getVal("master_account_number"),
-                    getVal("sub_account_number"),
+                    d.bank_name || "",
+                    d.fi_num || "",
+                    d.master_account_number || "",
+                    d.sub_account_number || "",
                 ]));
             });
 
