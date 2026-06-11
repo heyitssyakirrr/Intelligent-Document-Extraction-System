@@ -864,16 +864,17 @@ app.summary-table tr:last-child td { border-bottom: none; }
     min-height: 0;
     display: flex;
     flex-direction: row;
-    align-items: flex-start;
-    justify-content: center;
     gap: 32px;
     padding: 32px 48px;
     overflow: hidden;
-}
-
-#panelBatch .page-container:not(.has-results) {
+    /* Default: centered for pre-start state */
     align-items: center;
     justify-content: center;
+}
+
+/* POST-START: switch to top-aligned left+right layout */
+#panelBatch .page-container.has-results {
+    align-items: flex-start;
 }
 
 /* Left column: upload controls — scrollable if queue grows tall */
