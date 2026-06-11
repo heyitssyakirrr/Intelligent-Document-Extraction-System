@@ -8,15 +8,11 @@ GET  /extract/batch/download/{year}/{month}/{day}/{filename}
 
 Accepts multiple PDF or TXT files in a single multipart/form-data request.
 Processes each file through a two-stage pipeline:
-  Stage 1: Docling OCR  (runs concurrently with Stage 2)
+  Stage 1: PaddleOCR  (runs concurrently with Stage 2)
   Stage 2: LLM extraction (runs concurrently with Stage 1)
 
-Both stages retry up to _MAX_ATTEMPTS times with _RETRY_WAIT seconds between
-attempts before writing an error row and moving on.
-
-The client sets read timeout to Docling + LLM worst case (300 + 600 = 900s)
-per file. Server handles all retries internally so the client never needs to
-retry the whole batch.
+Both stages retry up to _MAX_ATTEMPTS times before writing an error row and
+moving on.
 
 CSV columns: filename, bank_name, fi_num, master_account_number, sub_account_number
 """
@@ -32,7 +28,7 @@ from fastapi import APIRouter, File, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.core.config import get_settings
-from app.features.router import _run_extraction
+from app.features.router import _run_extraction, _pdf_to_text_via_paddleocr
 from app.services.file_service import decode_txt_bytes, validate_and_read_upload
 
 logger = logging.getLogger(__name__)
@@ -41,20 +37,18 @@ router = APIRouter(prefix="/extract", tags=["Batch Extraction"])
 settings = get_settings()
 
 # ---------------------------------------------------------------------------
-# Output directory root — subfolders created per run
+# Output directory root
 # ---------------------------------------------------------------------------
 _OUTPUT_ROOT = Path("batch_outputs")
 
 # ---------------------------------------------------------------------------
 # Retry configuration
 # ---------------------------------------------------------------------------
-# Total attempts = 1 first try + 2 retries
 _MAX_ATTEMPTS = 3
-# Each retry increases the timeout by this many seconds (3 minutes)
 _RETRY_TIMEOUT_INCREMENT = 180.0
 
 # ---------------------------------------------------------------------------
-# Pipeline sentinel — signals Stage 2 that Stage 1 is done
+# Pipeline sentinel
 # ---------------------------------------------------------------------------
 _DONE = object()
 
@@ -100,22 +94,6 @@ def _comment(message: str) -> str:
 # ---------------------------------------------------------------------------
 
 async def _with_retry(label: str, base_timeout: float, coro_fn, *args, **kwargs):
-    """
-    Call an async function up to _MAX_ATTEMPTS times.
-    Each retry increases the timeout by _RETRY_TIMEOUT_INCREMENT seconds.
-
-    Attempt 1: base_timeout
-    Attempt 2: base_timeout + 1 x _RETRY_TIMEOUT_INCREMENT
-    Attempt 3: base_timeout + 2 x _RETRY_TIMEOUT_INCREMENT
-
-    The increased timeout is passed as a keyword argument 'timeout' to coro_fn.
-    Raises the last exception if all attempts fail.
-
-    label        — human-readable name for logging e.g. "OCR file1.pdf"
-    base_timeout — the normal timeout for attempt 1 (seconds)
-    coro_fn      — the async function to call
-    *args / **kwargs — forwarded to coro_fn
-    """
     last_exc: Exception | None = None
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         current_timeout = base_timeout + (attempt - 1) * _RETRY_TIMEOUT_INCREMENT
@@ -129,28 +107,19 @@ async def _with_retry(label: str, base_timeout: float, coro_fn, *args, **kwargs)
             last_exc = exc
             if attempt < _MAX_ATTEMPTS:
                 logger.warning(
-                    "%s — attempt %d/%d failed (timeout=%.0fs): %s — retrying with %.0fs",
+                    "%s — attempt %d/%d failed (timeout=%.0fs): %s — retrying",
                     label, attempt, _MAX_ATTEMPTS, current_timeout, exc,
-                    current_timeout + _RETRY_TIMEOUT_INCREMENT,
                 )
             else:
-                logger.error(
-                    "%s — all %d attempts failed: %s",
-                    label, _MAX_ATTEMPTS, exc,
-                )
+                logger.error("%s — all %d attempts failed: %s", label, _MAX_ATTEMPTS, exc)
     raise last_exc
 
 
 # ---------------------------------------------------------------------------
-# Pipeline Stage 1 — Docling OCR with retry
+# Pipeline Stage 1 — PaddleOCR with retry
 # ---------------------------------------------------------------------------
 
 async def _stage_ocr(files: list[UploadFile], queue: asyncio.Queue) -> None:
-    """
-    Reads each file, sends to Docling with retry, puts result into queue.
-    On permanent failure puts the exception so Stage 2 writes an error row.
-    Puts _DONE sentinel when all files are done.
-    """
     for index, upload in enumerate(files, start=1):
         filename = upload.filename or f"file_{index}"
         file_start = time.monotonic()
@@ -158,15 +127,13 @@ async def _stage_ocr(files: list[UploadFile], queue: asyncio.Queue) -> None:
             raw_bytes, ext = await validate_and_read_upload(upload)
 
             if ext == ".pdf":
-                from services.docling_client import DoclingClient
-                docling = DoclingClient()
                 text = await _with_retry(
                     f"OCR {filename}",
-                    settings.docling_timeout_seconds,
-                    docling.pdf_to_text, raw_bytes, filename,
+                    settings.llm_timeout_seconds,   # reuse a generous timeout
+                    _pdf_to_text_via_paddleocr, raw_bytes, filename,
                 )
             else:
-                # TXT — instant decode, no network call, no retry needed
+                # TXT — instant decode, no network call
                 text = decode_txt_bytes(raw_bytes)
 
             del raw_bytes
@@ -174,7 +141,6 @@ async def _stage_ocr(files: list[UploadFile], queue: asyncio.Queue) -> None:
             logger.debug("OCR done [%d] %s — queued for LLM", index, filename)
 
         except Exception as exc:
-            # All retries exhausted — pass error to Stage 2
             await queue.put((index, filename, None, file_start, exc))
             logger.warning("OCR permanently failed [%d] %s: %s", index, filename, exc)
 
@@ -182,20 +148,10 @@ async def _stage_ocr(files: list[UploadFile], queue: asyncio.Queue) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Core streaming generator — pipelined with retry
+# Core streaming generator
 # ---------------------------------------------------------------------------
 
 async def _stream_batch(files: list[UploadFile]) -> AsyncGenerator[str, None]:
-    """
-    Two-stage pipeline:
-      Stage 1 (OCR)  — background task, sends files to Docling
-      Stage 2 (LLM)  — main loop, reads from queue, calls LLM
-
-    Both stages retry individually up to _MAX_ATTEMPTS times.
-    The client read timeout is set to cover worst case per file:
-        Docling timeout (300s) + LLM timeout (600s) +
-        retry waits (2 × 180s) + buffer = ~1440s per file.
-    """
     total = len(files)
     ok_count = 0
     error_count = 0
@@ -212,7 +168,6 @@ async def _stream_batch(files: list[UploadFile]) -> AsyncGenerator[str, None]:
         f"/{csv_filename}"
     )
 
-    # maxsize=1: Stage 1 can be at most 1 file ahead of Stage 2
     queue: asyncio.Queue = asyncio.Queue(maxsize=1)
 
     try:
@@ -236,7 +191,6 @@ async def _stream_batch(files: list[UploadFile]) -> AsyncGenerator[str, None]:
                     if ocr_error is not None:
                         raise ocr_error
 
-                    # LLM with retry
                     result = await _with_retry(
                         f"LLM {filename}",
                         settings.llm_timeout_seconds,
