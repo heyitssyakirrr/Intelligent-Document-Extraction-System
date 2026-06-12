@@ -6,27 +6,11 @@ import re
 import time
 
 import httpx
-import asyncio
 from fastapi import HTTPException
 
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Module-level semaphore — created lazily so it binds to the running loop.
-# Controls how many LLM HTTP calls can be in-flight at the same time,
-# across ALL concurrent requests hitting this FastAPI instance.
-# ---------------------------------------------------------------------------
-_llm_semaphore: asyncio.Semaphore | None = None
-
-def _get_semaphore() -> asyncio.Semaphore:
-    global _llm_semaphore
-    if _llm_semaphore is None:
-        limit = get_settings().llm_max_concurrent
-        _llm_semaphore = asyncio.Semaphore(limit)
-        logger.info("LLM concurrency semaphore initialised (limit=%d)", limit)
-    return _llm_semaphore
 
 
 def _strip_trailing_commas(text: str) -> str:
@@ -246,30 +230,26 @@ class LLMClient:
         logger.debug("Prompt length: %d characters", len(prompt))
         logger.debug("Calling LLM microservice at %s", self.settings.llm_url)
 
-        sem = _get_semaphore()
-        async with sem:   
-            logger.debug(
-                "LLM semaphore acquired (limit=%d, waiting=%d)",
-                self.settings.llm_max_concurrent,
-                sem._value,  # remaining slots
-            )
-            try:
-                t0 = time.time()
-                effective_timeout = timeout if timeout is not None else self.settings.llm_timeout_seconds
-                async with httpx.AsyncClient(timeout=effective_timeout, verify=False) as client:
-                    response = await client.post(
-                        self.settings.llm_url,
-                        headers=self._build_headers(),
-                        json=payload,
-                    )
-                response.raise_for_status()
-                elapsed = time.time() - t0
-                logger.debug("LLM HTTP call took %.1fs", elapsed)
-                return _normalize_llm_output(response.json())
+        try:
+            t0 = time.time()
+            effective_timeout = timeout if timeout is not None else self.settings.llm_timeout_seconds
+            async with httpx.AsyncClient(timeout=effective_timeout, verify=False) as client:
+                response = await client.post(
+                    self.settings.llm_url,
+                    headers=self._build_headers(),
+                    json=payload,
+                )
+            response.raise_for_status()
+            elapsed = time.time() - t0
+            logger.debug("LLM HTTP call took %.1fs, raw response length: %d chars", elapsed, len(response.text))
 
-            except httpx.TimeoutException as exc:
-                raise HTTPException(status_code=504, detail="LLM microservice timed out.") from exc
-            except httpx.HTTPStatusError as exc:
-                raise HTTPException(status_code=502, detail=f"LLM microservice error: HTTP {exc.response.status_code}") from exc
-            except httpx.RequestError as exc:
-                raise HTTPException(status_code=502, detail="Unable to connect to LLM microservice.") from exc
+            result = _normalize_llm_output(response.json())
+            logger.debug("Final extracted dict keys: %s", list(result.keys()))
+            return result
+
+        except httpx.TimeoutException as exc:
+            raise HTTPException(status_code=504, detail="LLM microservice timed out.") from exc
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(status_code=502, detail=f"LLM microservice error: HTTP {exc.response.status_code}") from exc
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail="Unable to connect to LLM microservice.") from exc

@@ -20,11 +20,6 @@ class Settings(BaseSettings):
     max_tokens: int = 2048
 
     # ---------------------------------------------------------------------------
-    # LLM concurrency control
-    # ---------------------------------------------------------------------------
-    llm_max_concurrent: int = 1  # max simultaneous LLM calls across ALL requests
-
-    # ---------------------------------------------------------------------------
     # PaddleOCR (in-process) configuration
     # ---------------------------------------------------------------------------
     ocr_timeout_seconds: float = 300.0
