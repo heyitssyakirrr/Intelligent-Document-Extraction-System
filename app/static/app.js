@@ -262,6 +262,9 @@ document.addEventListener("DOMContentLoaded", function () {
         var idCounter  = 0;
         var exportBtn  = null;
         var llmPending = 0;    // track in-flight LLM calls for export btn timing
+        var LLM_MAX_CONCURRENT = 5;  // browser-side soft cap; real throttle is server semaphore
+        var llmActive = 0;
+        var llmQueue = [];
 
         // ---- drag & drop ----
         dropZone.addEventListener("dragover", function (e) { e.preventDefault(); dropZone.classList.add("drag-over"); });
@@ -406,9 +409,23 @@ document.addEventListener("DOMContentLoaded", function () {
             renderExportBtn();
         }
 
-        // ---- LLM extraction: fires independently per file ----
+        // Called when OCR finishes — either runs immediately or queues up
         function fireLlmExtraction(item, ocrText, txtFilename) {
             llmPending++;
+            llmQueue.push({ item: item, ocrText: ocrText, txtFilename: txtFilename });
+            _drainLlmQueue();
+        }
+
+        // Try to start queued LLM calls if slots are available
+        function _drainLlmQueue() {
+            while (llmActive < LLM_MAX_CONCURRENT && llmQueue.length > 0) {
+                var job = llmQueue.shift();
+                _runLlmJob(job.item, job.ocrText, job.txtFilename);
+            }
+        }
+
+        function _runLlmJob(item, ocrText, txtFilename) {
+            llmActive++;
 
             // Create the result card immediately (shows "Waiting for LLM…")
             var card = makeResultCard(item.file.name);
@@ -423,7 +440,8 @@ document.addEventListener("DOMContentLoaded", function () {
                 .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
                 .then(function (obj) {
                     if (!obj.ok || !obj.data.success) {
-                        var msg = (obj.data && (obj.data.detail || obj.data.message)) || ("HTTP " + (obj.status || "error"));                        item.extractError = msg;
+                        var msg = (obj.data && (obj.data.detail || obj.data.message)) || ("HTTP " + (obj.status || "error"));
+                        item.extractError = msg;
                         fillResultCardError(card, msg);
                         setPillStatus(item.statusEl, "error", "LLM Error");
                     } else {
@@ -439,8 +457,11 @@ document.addEventListener("DOMContentLoaded", function () {
                     setPillStatus(item.statusEl, "error", "Error");
                 })
                 .finally(function () {
+                    llmActive--;
                     llmPending--;
                     renderExportBtn();
+                    // Free up a slot — start the next queued job if any
+                    _drainLlmQueue();
                     // If OCR queue already finished and this was the last LLM call
                     if (!isRunning && llmPending === 0) restoreUiAfterAll();
                 });
@@ -577,6 +598,8 @@ document.addEventListener("DOMContentLoaded", function () {
             queue      = [];
             idCounter  = 0;
             llmPending = 0;
+            llmActive  = 0;
+            llmQueue   = [];
             if (exportBtn) { exportBtn.remove(); exportBtn = null; }
             isRunning = false;
             fileListEl.innerHTML = "";
