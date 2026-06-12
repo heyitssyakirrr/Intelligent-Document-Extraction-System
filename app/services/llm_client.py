@@ -247,7 +247,7 @@ class LLMClient:
         logger.debug("Calling LLM microservice at %s", self.settings.llm_url)
 
         sem = _get_semaphore()
-        async with sem:   # ← ALL the magic is here
+        async with sem:   
             logger.debug(
                 "LLM semaphore acquired (limit=%d, waiting=%d)",
                 self.settings.llm_max_concurrent,
