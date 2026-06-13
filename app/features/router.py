@@ -257,7 +257,7 @@ def _write_audit_csv(records: list[dict]) -> None:
             extracted = (data.get(key) or "").strip()
             expected  = ((cmp.get(key) or {}).get("expected") or "").strip()
             row_data += [extracted, expected]
-            is_match = bool(extracted and expected and extracted == expected)
+            is_match = bool(extracted and expected and extracted.upper() == expected.upper())
             matches.append(is_match)
             if is_match:
                 accurate_count += 1
