@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_extract_endpoint: str = ""
     llm_timeout_seconds: float = 600.0
+    llm_max_concurrent: int = 3             # matches pod count, controls semaphore
+    llm_max_retries: int = 2                # retries per file before marking error
+    llm_retry_base_backoff: float = 2.0     # seconds, doubles each retry
     llm_api_key: str | None = None
     llm_model_name: str = ""
     helper_id: str = ""

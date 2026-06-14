@@ -7,13 +7,14 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.core.config import get_settings
 from app.features.batch_router import router as batch_router
 from app.features.router import router as extract_router
+from app.features.router import _start_cleanup_scheduler
 from app.features.ocr_router import router as ocr_router
 from app.summary.router import router as summarise_router
 
@@ -27,48 +28,15 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 templates = Jinja2Templates(directory="app/templates")
 
-# ---------------------------------------------------------------------------
-# OCR results directory — written by router.py after each in-process OCR run
-# ---------------------------------------------------------------------------
-_RESULTS_DIR = Path("results").resolve()
-_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# Startup cleanup — delete .txt files older than ocr_results_max_age_days
-# ---------------------------------------------------------------------------
-
-def _cleanup_old_ocr_results() -> None:
-    max_age_seconds = settings.ocr_results_max_age_days * 86_400
-    cutoff = time.time() - max_age_seconds
-    deleted = 0
-    for f in _RESULTS_DIR.glob("*.txt"):
-        try:
-            if f.stat().st_mtime < cutoff:
-                f.unlink()
-                deleted += 1
-        except Exception as exc:
-            logger.warning("Could not delete old OCR result %s: %s", f.name, exc)
-    if deleted:
-        logger.info(
-            "Startup cleanup: removed %d OCR result file(s) older than %d day(s)",
-            deleted, settings.ocr_results_max_age_days,
-        )
-    else:
-        logger.info(
-            "Startup cleanup: no OCR result files older than %d day(s)",
-            settings.ocr_results_max_age_days,
-        )
-
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     logger.info("Starting %s v%s", settings.app_name, settings.app_version)
     logger.info("LLM endpoint : %s", settings.llm_url)
-    logger.info("OCR results  : %s (in-process PaddleOCR)", _RESULTS_DIR)
+    logger.info("OCR results  : results/ (in-process PaddleOCR, cleaned up by router.py)")    
     logger.info("OCR service  : POST /ocr/upload, GET /ocr/download/<file>")
     logger.info("Batch API    : POST /extract/batch (max %d files)", settings.max_files_per_batch)
-    _cleanup_old_ocr_results()
+    _start_cleanup_scheduler()
     yield
     logger.info("Shutting down %s", settings.app_name)
 
@@ -104,38 +72,6 @@ async def home(request: Request):
 @app.get("/health", tags=["Meta"])
 async def app_health() -> dict[str, str]:
     return {"status": "ok"}
-
-
-@app.get("/ocr-download/{filename}", tags=["OCR"])
-async def download_ocr_result(filename: str):
-    """
-    Serve a .txt file from the OCR results directory.
-    Written by the in-process PaddleOCR run in router.py.
-    Path traversal is prevented by resolving and confirming the path
-    stays inside _RESULTS_DIR.
-    """
-    if ".." in filename or "/" in filename or "\\" in filename:
-        raise HTTPException(status_code=400, detail="Invalid filename.")
-
-    safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in filename)
-    file_path = (_RESULTS_DIR / safe_name).resolve()
-
-    try:
-        file_path.relative_to(_RESULTS_DIR)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid path.")
-
-    if not file_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"OCR result file '{safe_name}' not found.",
-        )
-
-    return FileResponse(
-        path=str(file_path),
-        media_type="text/plain",
-        filename=safe_name,
-    )
 
 
 @app.exception_handler(Exception)

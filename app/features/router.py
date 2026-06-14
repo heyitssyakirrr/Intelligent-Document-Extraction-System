@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import random
 import tempfile
+import time
+import threading
 
 import httpx
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from pathlib import Path
+from typing import AsyncIterator
 
 from app.features.prompt import build_extraction_prompt
 from app.models.schemas import ExtractResponse, ExtractionMeta, ExtractionResult
@@ -21,6 +27,51 @@ llm_client = LLMClient()
 settings = get_settings()
 
 logger = logging.getLogger(__name__)
+
+# LLM concurrency — semaphore limit matches pod count.
+# Waiting happens here (no timeout clock), not inside the LLM service.
+_llm_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_llm_semaphore() -> asyncio.Semaphore:
+    """Lazy-init so the semaphore is created inside the running event loop."""
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        _llm_semaphore = asyncio.Semaphore(settings.llm_max_concurrent)
+    return _llm_semaphore
+
+# ---------------------------------------------------------------------------
+# Path to txt files from ocr and cleanup function
+# ---------------------------------------------------------------------------
+
+_RESULTS_DIR = Path("results").resolve()
+_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+def _cleanup_old_ocr_results(max_age_seconds: int = 3600) -> None:
+    """Delete OCR text files older than max_age_seconds from results/."""
+    now = time.time()
+    deleted = 0
+    for f in _RESULTS_DIR.glob("paddle_*.txt"):
+        try:
+            if now - f.stat().st_mtime > max_age_seconds:
+                f.unlink()
+                deleted += 1
+        except OSError:
+            pass
+    if deleted:
+        logger.info("Cleaned up %d old OCR result file(s) from %s", deleted, _RESULTS_DIR)
+
+
+def _start_cleanup_scheduler(interval_seconds: int = 1800, max_age_seconds: int = 3600) -> None:
+    """Run _cleanup_old_ocr_results on a background thread, every interval_seconds."""
+    def _loop():
+        while True:
+            time.sleep(interval_seconds)
+            _cleanup_old_ocr_results(max_age_seconds)
+
+    t = threading.Thread(target=_loop, daemon=True, name="ocr-cleanup")
+    t.start()
+    logger.info("OCR cleanup scheduler started (interval=%ds, max_age=%ds)", interval_seconds, max_age_seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +97,14 @@ async def _pdf_to_text_via_paddleocr(pdf_bytes: bytes, filename: str, timeout: f
         text = await loop.run_in_executor(None, process_pdf, tmp.name)
 
         logger.debug("PaddleOCR returned %d characters for '%s'", len(text), filename)
+
+        # Save OCR text to results/ so the browser can download it
+        stem = Path(filename).stem.lower().replace(" ", "_")
+        txt_filename = f"paddle_{stem}.txt"
+        out_path = _RESULTS_DIR / txt_filename
+        out_path.write_text(text, encoding="utf-8")
+        logger.debug("OCR text saved to %s", out_path)
+
         return text
     finally:
         Path(tmp.name).unlink(missing_ok=True)
@@ -163,7 +222,209 @@ async def ocr_only(file: UploadFile = File(...)) -> JSONResponse:
     except Exception as exc:
         return JSONResponse({"status": "error", "text": None, "txt_filename": None, "error": str(exc)})
     
-    # ---------------------------------------------------------------------------
+@router.get("/ocr-download/{filename}")
+async def ocr_download(filename: str) -> FileResponse:
+    """
+    Download a previously saved OCR text file from results/.
+    Prevents path traversal by resolving inside _RESULTS_DIR.
+    """
+    safe_name = Path(filename).name
+    file_path = _RESULTS_DIR / safe_name
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"File '{safe_name}' not found.")
+
+    return FileResponse(
+        path=str(file_path),
+        media_type="text/plain",
+        filename=safe_name,
+    )
+
+# ---------------------------------------------------------------------------
+# The Protected LLM Worker
+# ---------------------------------------------------------------------------
+
+async def _llm_task(
+    index: int,
+    total: int,
+    filename: str,
+    ocr_text: str,
+    out_queue: asyncio.Queue,
+) -> None:
+    """
+    Acquire semaphore slot → call LLM → retry on failure → push event to queue.
+
+    Waiting on the semaphore is free (no timeout clock).
+    The 600s timeout only starts when the request actually enters the LLM service.
+    Retries get a fresh 600s clock each time.
+    """
+    sem       = _get_llm_semaphore()
+    last_exc: Exception | None = None
+
+    for attempt in range(settings.llm_max_retries + 1):
+        if attempt > 0:
+            backoff = settings.llm_retry_base_backoff * (2 ** (attempt - 1))
+            jitter  = random.uniform(0.0, 1.0)
+            wait    = backoff + jitter
+            logger.warning(
+                "LLM retry %d/%d for '%s' — waiting %.1fs",
+                attempt, settings.llm_max_retries, filename, wait,
+            )
+            # Slot is NOT held during backoff sleep.
+            # Other waiting files can acquire it freely.
+            await asyncio.sleep(wait)
+
+        # Re-acquire slot fresh for each attempt.
+        # If other files are waiting, they compete fairly here.
+        async with sem:
+            try:
+                result = await _run_extraction(original_text=ocr_text, source=filename)
+            except Exception as exc:
+                # Slot released immediately on exception (end of async with)
+                last_exc = exc
+                logger.warning(
+                    "LLM attempt %d/%d failed for '%s': %s",
+                    attempt + 1, settings.llm_max_retries + 1, filename, exc,
+                )
+                continue  # go to next attempt, slot is already free
+
+        # Success — slot already released by async with
+        await out_queue.put({
+            "index": index, "total": total, "filename": filename,
+            "stage": "llm_done", "result": result.model_dump(),
+        })
+        return
+
+    # All retries exhausted
+    logger.error(
+        "LLM permanently failed for '%s' after %d attempts: %s",
+        filename, settings.llm_max_retries + 1, last_exc,
+    )
+    await out_queue.put({
+        "index": index, "total": total, "filename": filename,
+        "stage": "error", "error": str(last_exc),
+    })
+
+# ---------------------------------------------------------------------------
+# Stream Batch Pipeline (OCR, LLM, CSV)
+# ---------------------------------------------------------------------------
+
+async def _stream_batch_pipeline(files: list[UploadFile]) -> AsyncIterator[str]:
+    """
+    OCR runs sequentially — one file at a time.
+    LLM tasks fire as each OCR completes and run concurrently,
+    capped at llm_max_concurrent (semaphore) so no file ever queues
+    inside the LLM service — eliminating timeout risk.
+    Results stream to the browser as each task settles.
+    """
+    total      = len(files)
+    llm_tasks: list[asyncio.Task] = []
+    out_queue: asyncio.Queue      = asyncio.Queue()
+    audit_records: list[dict]     = []
+
+    # --- OCR loop (sequential) ---
+    for index, upload in enumerate(files, start=1):
+        filename = upload.filename or f"file_{index}"
+
+        try:
+            raw_bytes, ext = await validate_and_read_upload(upload)
+            if ext != ".pdf":
+                await out_queue.put({
+                    "index": index, "total": total, "filename": filename,
+                    "stage": "error", "error": "Only PDF files are supported.",
+                })
+                # fire a no-op task so task count stays consistent
+                llm_tasks.append(asyncio.create_task(asyncio.sleep(0)))
+                continue
+
+            ocr_text = await _pdf_to_text_via_paddleocr(raw_bytes, filename)
+            stem         = Path(filename).stem.lower().replace(" ", "_")
+            txt_filename = f"paddle_{stem}.txt"
+
+            await out_queue.put({
+                "index": index, "total": total, "filename": filename,
+                "stage": "ocr_done", "txt_filename": txt_filename,
+            })
+
+        except Exception as exc:
+            logger.warning("OCR failed [%d/%d] '%s': %s", index, total, filename, exc)
+            await out_queue.put({
+                "index": index, "total": total, "filename": filename,
+                "stage": "error", "error": str(exc),
+            })
+            llm_tasks.append(asyncio.create_task(asyncio.sleep(0)))
+            continue
+
+        # Fire LLM task immediately — it will wait on semaphore internally
+        task = asyncio.create_task(
+            _llm_task(index, total, filename, ocr_text, out_queue)
+        )
+        llm_tasks.append(task)
+
+    # --- Drain the queue, yield events as they arrive ---
+    # We know exactly how many events to expect:
+    #   - 1 ocr_done (or error) per file  → already in queue from loop above
+    #   - 1 llm_done (or error) per file  → pushed by tasks as they complete
+    expected_llm_events = len(llm_tasks)
+    llm_events_received = 0
+
+    while llm_events_received < expected_llm_events:
+        event = await out_queue.get()
+        stage = event.get("stage")
+
+        if stage in ("llm_done", "error"):
+            llm_events_received += 1
+            if stage == "llm_done":
+                audit_records.append({
+                    "filename":      event["filename"],
+                    "extractResult": event["result"],
+                    "extractError":  None,
+                })
+            else:
+                audit_records.append({
+                    "filename":      event["filename"],
+                    "extractResult": None,
+                    "extractError":  event.get("error"),
+                })
+
+        yield json.dumps(event) + "\n"
+
+    # --- Audit log (server-side, after all files done) ---
+    if audit_records:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write_audit_csv, audit_records)
+
+    yield json.dumps({"stage": "batch_done", "total": total}) + "\n"
+
+
+@router.post("/batch-pipeline")
+async def batch_pipeline(
+    files: list[UploadFile] = File(...),
+) -> StreamingResponse:
+    """
+    Server-driven batch pipeline: accepts all files, runs OCR→LLM per file,
+    streams newline-delimited JSON progress events, writes audit log internally.
+    """
+    if not files:
+        raise HTTPException(status_code=422, detail="No files provided.")
+
+    max_files = settings.max_files_per_batch
+    if len(files) > max_files:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Too many files. Received {len(files)}, maximum is {max_files}.",
+        )
+
+    logger.info("Batch pipeline request — %d file(s)", len(files))
+
+    return StreamingResponse(
+        _stream_batch_pipeline(files),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Audit log — developer-only, never served back to the browser
 # ---------------------------------------------------------------------------
 
@@ -307,22 +568,3 @@ def _write_audit_csv(records: list[dict]) -> None:
 
     wb.save(str(path))
     logger.info("Audit log saved: %s (%d record(s), accuracy %.2f%%)", path, len(records), pct if total_fields else 0.0)
-
-
-@router.post("/audit-log", include_in_schema=False)
-async def save_audit_log(payload: dict) -> JSONResponse:
-    """
-    Receives the full batch result from the browser and writes an audit CSV
-    to audit_logs/ on disk. Returns 204 — the response body is intentionally
-    empty so the browser never reads sensitive comparison data back.
-    """
-    from fastapi.responses import Response
-
-    records = payload.get("results") or []
-    if records:
-        # Run the blocking file-write in a thread so we don't block the event loop
-        import asyncio
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _write_audit_csv, records)
-
-    return Response(status_code=204)
