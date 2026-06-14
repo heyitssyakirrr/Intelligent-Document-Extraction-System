@@ -30,14 +30,9 @@ logger = logging.getLogger(__name__)
 
 # LLM concurrency — semaphore limit matches pod count.
 # Waiting happens here (no timeout clock), not inside the LLM service.
-_llm_semaphore: asyncio.Semaphore | None = None
-
+_llm_semaphore: asyncio.Semaphore = asyncio.Semaphore(settings.llm_max_concurrent)
 
 def _get_llm_semaphore() -> asyncio.Semaphore:
-    """Lazy-init so the semaphore is created inside the running event loop."""
-    global _llm_semaphore
-    if _llm_semaphore is None:
-        _llm_semaphore = asyncio.Semaphore(settings.llm_max_concurrent)
     return _llm_semaphore
 
 # ---------------------------------------------------------------------------
