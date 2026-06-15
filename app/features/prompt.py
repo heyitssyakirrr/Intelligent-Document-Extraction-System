@@ -80,7 +80,7 @@ Example (fi_num on the left):
     | 022204026 | 205340722O/D88 | 342385069101SLUMYR |
       ^fi_num     ^master_acc      ^sub_acc
 Always assign fi_num to the SHORTEST value. If only two values appear in the
-table row, there is no sub account — return null for sub_account_number.
+table row, there is no sub account — return the value of master_account_number for sub_account_number.
 
 --- LAYOUT B: labeled key-value lines ---
 Each value has its own line with an explicit label.
@@ -149,10 +149,48 @@ Example:
 In ALL layouts the logical roles are:
     fi_num → master_account_number → sub_account_number
 
+================================================================================
+COMMON EXTRACTION MISTAKES — DO NOT REPEAT THESE
+================================================================================
+These show real LLM errors. Study them to avoid making the same mistake.
+
+MISTAKE 1 — fi_num and master swapped (Layout A pipe table):
+  Document:  | 88820006220322 | 034907013 |
+  WRONG:  fi_num="88820006220322"  master="034907013"
+  RIGHT:  fi_num="034907013"       master="88820006220322"
+  Why: 034907013 is 9 chars starting with 0 → it is ALWAYS the fi_num.
+
+MISTAKE 2 — Layout D, sub account copied from master instead of (c) line:
+  Document:
+    a) Fi Code           : 022612078
+    b) Master Account No : 3000170346
+    c) Sub Account No    : 387805903200000
+  WRONG:  fi_num="022612078"  master="3000170346"  sub="3000170346"
+  RIGHT:  fi_num="022612078"  master="3000170346"  sub="387805903200000"
+  Why: sub_account_number comes from the (c) line, NOT a copy of (b).
+
+MISTAKE 3 — footnote digit mistaken for sub account (combined label):
+  Document:  MASTER / SUB ACCOUNT NO. 2 : 172-412188-7-00000
+  WRONG:  master="172-412188-7-00000"  sub="2"
+  RIGHT:  master="172-412188-7-00000"  sub="172-412188-7-00000"
+  Why: "2" after "NO." is a footnote marker. Both fields share the one value.
+
+MISTAKE 4 — RENTAS account used as master account:
+  Document has FI Code section AND a separate "RENTAS Account No. 309-909570-005"
+  WRONG:  master="309-909570-005"
+  RIGHT:  master = the account in the FI Code/Facility Account section, not RENTAS.
+
+MISTAKE 5 — fi_num starting with 1 (CCRIS layout):
+  Document:  CCRIS Fl Code : 1035312016, 035312016
+  WRONG:  fi_num="1035312016"
+  RIGHT:  fi_num="035312016"  (take the value starting with 0, not 1)
+
 --- FI CODE (fi_num) ---
-- A short institution/routing code — typically 7 to 9 digits.
-- ALWAYS the shortest of the three values.
-- Starts with 0 (most banks) or 3 (BSN, Bank Rakyat). NEVER starts with 1.
+- A short institution/routing code — typically either 9 characters with only 9 digits or 
+  10 characters with 9 digits and 1 underscore or 1 hyphen.
+- USUALLY the shortest of the three values except for Standard Chartered Bank it is the longest 
+  (9 chars for fi_num while 8 chars for master_account_number and sub_account_number).
+- Starts with 0 (most banks) or 3 (BSN, Bank Rakyat). NEVER starts with other number than 0 or 3.
 - May contain underscores or hyphens (Maybank only): "0227_13014", "0227-11038".
 - NOT a phone number, postcode, reference number, or RENTAS clearing account.
 - If multiple comma-separated candidates exist, choose the one starting with 0 or 3.
@@ -295,13 +333,13 @@ STEP 2 — DETECT THE LAYOUT
       (first value only per line).
 
 STEP 3 — ASSIGN THE THREE VALUES
-  fi_num                ← shortest value, starts with 0 or 3, 7–9 chars
+  fi_num                ← shortest value, starts with 0 or 3, usually 9-10 chars never shorter or longer than 9-10 chars
   master_account_number ← as described above for the detected layout
   sub_account_number    ← as described above for the detected layout (or null)
 
 STEP 4 — SANITY-CHECK
-  • fi_num starts with 0 or 3, is 7–9 characters, never longer than master account.
-  • fi_num never starts with 1.
+  • fi_num starts with 0 or 3, is 9-10 characters and never longer or shorter than 9-10 characters.
+  • fi_num never starts with other number than 0 or 3.
   • master_account_number ≠ fi_num.
   • In Layout D, confirm master_account_number came from the (b) "Master Account"
     line and sub_account_number came from the (c) "Sub Account" line — they are
@@ -328,6 +366,25 @@ STEP 7 — FIND THE CUSTOMER ADDRESS (if any)
   Exclude bank branch and law firm (cc:) addresses.
 
 STEP 8 — OUTPUT THE JSON.
+
+================================================================================
+FINAL VALIDATION GATE — answer these before writing the JSON
+================================================================================
+1. Is fi_num 9 or 10 characters? If longer or shorter → STOP, re-identify fi_num.
+2. Does fi_num start with 0 or 3? If starts with 1 or other numbers than 0 or 3 → STOP, 
+   take the other value that starts with 0 or 3.
+3. Is master_account_number or sub_account_number 9 or 10 characters and 
+   either start with 0 or 3? If yes → STOP, re-read.
+4. If the layout was D (lettered list): did master come from the (b) line and 
+   sub come from the (c) line independently? If not → STOP, re-read.
+5. If the layout had a combined "MASTER / SUB ACCOUNT NO." label: are both 
+   master AND sub set to the same single account value? If not → STOP, they are the same value.
+6. Is sub_account_number something other than a standalone digit like "2" or "1"?
+   If it's a single digit → STOP, that is a footnote, re-read for the real sub.
+7. Is the RENTAS/IBG clearing account being used as master? If yes → STOP, 
+   use the value in the FI Code section instead.
+Only write the JSON after all 7 checks pass.
+================================================================================
 
 ================================================================================
 OUTPUT
