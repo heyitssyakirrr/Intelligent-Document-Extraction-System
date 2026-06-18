@@ -5,6 +5,7 @@ os.environ["FLAGS_use_mkldnn"] = "0"
 
 import time
 import logging
+import math
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ def _get_ocr():
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
+        use_angle_cls=True,
         text_det_thresh=0.3,
         text_det_box_thresh=0.5,
         text_det_unclip_ratio=1.8,
@@ -88,6 +90,87 @@ def _pdf_to_images(pdf_path: str, dpi: int = 300) -> list[tuple[int, object]]:
     doc.close()
     return images
 
+def _auto_deskew_image(img_array, max_skew_degrees: float = 10.0):
+    """
+    Automatically correct small page skew before OCR.
+
+    This is intended for scanned PDFs where the page is tilted slightly left/right.
+    It only rotates when the detected angle is realistic and safe.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        logger.warning("OpenCV not installed; skipping deskew.")
+        return img_array
+
+    if img_array is None:
+        return img_array
+
+    original = img_array
+
+    try:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+
+        # Invert threshold so text becomes white on black background.
+        gray = cv2.bitwise_not(gray)
+        thresh = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY | cv2.THRESH_OTSU,
+        )[1]
+
+        coords = np.column_stack(np.where(thresh > 0))
+        if coords.size == 0:
+            logger.debug("Deskew skipped: no foreground pixels found.")
+            return original
+
+        angle = cv2.minAreaRect(coords)[-1]
+
+        # OpenCV returns angles in a slightly awkward range.
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+
+        if not math.isfinite(angle):
+            logger.debug("Deskew skipped: invalid angle.")
+            return original
+
+        # Guardrails: only correct small scan skew.
+        if abs(angle) < 0.3:
+            logger.debug("Deskew skipped: angle %.2f is too small.", angle)
+            return original
+
+        if abs(angle) > max_skew_degrees:
+            logger.warning(
+                "Deskew skipped: detected angle %.2f exceeds safe limit %.2f.",
+                angle,
+                max_skew_degrees,
+            )
+            return original
+
+        height, width = img_array.shape[:2]
+        center = (width // 2, height // 2)
+
+        matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+        deskewed = cv2.warpAffine(
+            img_array,
+            matrix,
+            (width, height),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
+        logger.info("Deskew applied: %.2f degrees", angle)
+        return deskewed
+
+    except Exception as exc:
+        logger.warning("Deskew failed; using original image: %s", exc)
+        return original
+
 
 def process_pdf(pdf_path: str, dpi: int = 300) -> str:
     pdf_path = str(pdf_path)
@@ -101,6 +184,8 @@ def process_pdf(pdf_path: str, dpi: int = 300) -> str:
 
     for page_num, img_array in images:
         logger.debug("OCR on page %d...", page_num)
+
+        img_array =  _auto_deskew_image(img_array)
 
         try:
             results = ocr.ocr(img_array, cls=True)
