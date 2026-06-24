@@ -26,7 +26,6 @@ class Settings(BaseSettings):
     # PaddleOCR (in-process) configuration
     # ---------------------------------------------------------------------------
     ocr_timeout_seconds: float = 300.0
-    ocr_results_max_age_days: int = 7
 
     # ---------------------------------------------------------------------------
     # Input safety
