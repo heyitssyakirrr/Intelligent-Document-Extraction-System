@@ -12,8 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.core.config import get_settings
-from app.features.single_router import router as single_router
-from app.features.single_router import drain_pending_tasks, start_ocr_worker
+from app.features.extraction import router as single_router
+from app.features.extraction import drain_pending_tasks, start_ocr_worker
 
 logging.basicConfig(
     level=logging.DEBUG,
