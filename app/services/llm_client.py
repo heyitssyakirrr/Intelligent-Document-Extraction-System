@@ -17,7 +17,6 @@ _EXPECTED_KEYS = {
     "name",
     "master_account_number",
     "sub_account_number",
-    "address",
     "fi_num",
     "bank_name",
 }

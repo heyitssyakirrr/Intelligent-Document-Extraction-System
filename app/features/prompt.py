@@ -34,7 +34,7 @@ def build_extraction_prompt(text: str) -> str:
     """Prompt for customer detail extraction."""
     return f"""\
 You are a data extraction assistant for a Malaysian bank's internal system.
-Your task is to extract exactly six fields from a bank document.
+Your task is to extract exactly five fields from a bank document.
 
 === RULES ===
 0. You are in JSON-only mode. Your entire response must be a single JSON object. Stop immediately after the closing brace. No introduction, no explanation, no conclusion.
@@ -268,15 +268,7 @@ MISTAKE 6 — fi_num and master swapped in Flat CCRIS table (Layout G):
   "MASTER / SUB" label.
 
 ================================================================================
-FIELD 5 — ADDRESS
-================================================================================
-- The customer's mailing or residential address.
-- May span multiple lines — combine into one string separated by commas.
-- Ignore bank branch addresses and law firm / third-party addresses (cc: blocks).
-- Return null if no customer address is present.
-
-================================================================================
-FIELD 6 — BANK NAME
+FIELD 5 — BANK NAME
 ================================================================================
 These documents are letters SENT BY Public Bank Berhad or Public Islamic Bank
 TO a customer, about a third-party bank account being redeemed or refinanced.
@@ -399,10 +391,7 @@ STEP 5 — FIND THE BANK NAME
 STEP 6 — FIND THE CUSTOMER NAME
   All-caps Malaysian name. Exclude staff, bank, and law firm names.
 
-STEP 7 — FIND THE CUSTOMER ADDRESS (if any)
-  Exclude bank branch and law firm (cc:) addresses.
-
-STEP 8 — OUTPUT THE JSON.
+STEP 7 — OUTPUT THE JSON.
 
 ================================================================================
 FINAL VALIDATION GATE — answer these before writing the JSON
@@ -432,7 +421,6 @@ JUST RETURN ONLY this JSON object with no other text in the response:
     "name": "<full customer name or null>",
     "master_account_number": "<master account number copied exactly as printed, or null>",
     "sub_account_number": "<sub account number copied exactly as printed, or null>",
-    "address": "<full address or null>",
     "fi_num": "<FI number copied exactly as printed, or null>",
     "bank_name": "<canonical bank name from the known list, or null>"
 }}

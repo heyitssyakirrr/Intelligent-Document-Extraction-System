@@ -108,7 +108,6 @@ async def _run_llm_extraction(ctx: FileProcessingContext, ocr_text: str) -> Extr
         name=llm_result.get("name"),
         master_account_number=llm_result.get("master_account_number"),
         sub_account_number=llm_result.get("sub_account_number"),
-        address=llm_result.get("address"),
         fi_num=llm_result.get("fi_num"),
         bank_name=llm_result.get("bank_name"),
     )

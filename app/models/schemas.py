@@ -10,9 +10,8 @@ class ExtractionResult(BaseModel):
     name: str | None = Field(default=None)
     master_account_number: str | None = Field(default=None)
     sub_account_number: str | None = Field(default=None)
-    address: str | None = Field(default=None)
     fi_num: str | None = Field(default=None)
-    bank_name: str | None = Field(default=None)   # NEW: extracted by LLM
+    bank_name: str | None = Field(default=None)  
 
 
 class ExtractionMeta(BaseModel):
