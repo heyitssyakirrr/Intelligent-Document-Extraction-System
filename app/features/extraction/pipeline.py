@@ -12,7 +12,7 @@ from app.features.extraction.concurrency import (
     _ocr_queue,
     _track_task,
 )
-from app.features.extraction.storage import append_failure_row, append_success_row
+from app.features.extraction.storage import append_failure_row, append_success_row, append_ocr_output
 from app.features.prompt import build_extraction_prompt
 from app.models.schemas import ExtractionResult
 from app.services.llm_client import LLMClient
@@ -139,6 +139,11 @@ async def _ocr_worker() -> None:
             await append_failure_row(pdf_bytes, filename, msg)
             _ocr_queue.task_done()
             continue
+
+        try:
+            await append_ocr_output(ocr_text, filename)
+        except Exception as exc:
+            logger.warning("Failed to persist OCR output for '%s': %s", filename, exc)
 
         failure_bytes = pdf_bytes
         pdf_bytes = None
