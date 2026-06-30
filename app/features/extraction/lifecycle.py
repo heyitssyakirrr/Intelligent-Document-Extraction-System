@@ -1,3 +1,52 @@
+"""
+Durability layer for the single-extraction pipeline.
+
+Problem this module solves
+---------------------------
+Every uploaded file moves through OCR-queue -> OCR -> LLM stage purely in
+process memory (an asyncio.Queue entry, then a Python variable closed over
+by a background asyncio.Task). If the process stops for ANY reason while a
+file is mid-flight -- graceful shutdown, redeploy, crash, OOM-kill, power
+loss -- that file disappears with no trace: not in extractions.csv, not in
+failed.csv, no copy in failed_files/, no summary log line.
+
+Fix
+---
+Two durable, on-disk artifacts per in-flight file, both owned by this
+module only, both written the moment a file is accepted -- *before* it is
+ever queued for OCR:
+
+1. The raw PDF bytes themselves, staged under uploads/inflight/files/.
+   This replaces relying on the in-memory `pdf_bytes` variable for failure
+   recovery -- a real, durable copy now exists from intake onward.
+2. A small JSON "record" file (uploads/inflight/records/{intake_id}.json)
+   describing that upload. One file per upload, not one shared log, so:
+     - there is nothing to compact or prune -- the record is deleted the
+       instant the file reaches a terminal state (mark_terminal), so the
+       on-disk footprint is always exactly "however many files are
+       currently in flight", never larger.
+     - a torn/partial write from a hard kill can only ever affect that one
+       file's own record, never any other file's.
+
+On every startup (`recover_orphaned_files`), any record file still present
+means its upload was accepted but never reached a terminal state -- i.e.
+the previous run died while it was mid-pipeline. It is recovered using its
+staged PDF bytes and written into the existing failed CSV / failed_files /
+summary log via the same storage.py code paths that normal failures
+already use, so success/failure recording semantics are not duplicated,
+only triggered from a second place.
+
+On shutdown (`drain_and_finalize`), in-flight tasks are still given a
+bounded grace period to finish normally (unchanged behavior), but anything
+that *doesn't* finish in time is no longer "abandoned" -- it is simply left
+for `recover_orphaned_files` to pick up on the next boot, because its
+staged bytes and record file are already safely on disk.
+
+Everything else in the codebase only ever calls the public functions
+below. No other module needs to know the record format or the inflight
+directory layout.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -107,7 +156,11 @@ async def register_intake(filename: str, processing_timestamp: str, pdf_bytes: b
 async def mark_terminal(intake_id: str, filename: str, final_status: str) -> None:
     """
     Call exactly once a file reaches success or failure. Deletes its record
-    file and its staged PDF copy
+    file and its staged PDF copy -- by this point the outcome is already
+    durable elsewhere (extractions.csv, or failed.csv + failed_files/, both
+    written by storage.py before this is called), so nothing further needs
+    to be kept around for this file. There is no log to compact: once this
+    runs, this file leaves zero trace in the inflight area, by design.
     """
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _clear_inflight_sync, intake_id)
@@ -149,6 +202,28 @@ def _read_all_records_sync() -> list[dict[str, Any]]:
 async def recover_orphaned_files(record_failure_fn) -> int:
     """
     Run once at startup, before the OCR worker begins accepting new work.
+
+    `record_failure_fn` is an injected callback:
+        async (intake_id, filename, pdf_bytes, stage, error_message) -> None
+    It is responsible for both writing the failure record (failed.csv +
+    failed_files/) AND calling mark_terminal(intake_id, ...) itself,
+    immediately after that write succeeds -- mirroring exactly how
+    pipeline._record_failure handles the live failure path. This ensures
+    a downstream bug (e.g. in summary-log writing) can never leave the
+    lifecycle record unresolved, which would otherwise cause the same
+    orphan to be "recovered" again -- and get a duplicate failed.csv row
+    -- on every subsequent restart.
+
+    Lifecycle deliberately does not import pipeline.py's failure-recording
+    logic directly, to avoid a circular import (pipeline.py is what calls
+    into this module). The caller (pipeline.start_ocr_worker) wires the
+    real implementation in.
+
+    Every record file still present at startup is, by definition, orphaned
+    -- mark_terminal deletes the record the instant a file resolves, so
+    anything left over can only mean the previous run stopped before that
+    file finished.
+
     Returns the number of orphaned files recovered.
     """
     loop = asyncio.get_running_loop()
@@ -183,6 +258,7 @@ async def recover_orphaned_files(record_failure_fn) -> int:
         try:
             pdf_bytes = await loop.run_in_executor(None, inflight_path.read_bytes)
             await record_failure_fn(
+                intake_id,
                 filename,
                 pdf_bytes,
                 "interrupted",
@@ -190,7 +266,6 @@ async def recover_orphaned_files(record_failure_fn) -> int:
                 "crash before this file reached a terminal state; "
                 "recovered automatically on the next startup.",
             )
-            await mark_terminal(intake_id, filename, "failed")
             recovered += 1
         except Exception:
             # Leave the record + staged file in place -- they will be
@@ -210,9 +285,14 @@ async def recover_orphaned_files(record_failure_fn) -> int:
 # ---------------------------------------------------------------------------
 async def drain_and_finalize(pending_tasks: "set[asyncio.Task]", timeout: float | None = None) -> None:
     """
-    Anything that doesn't finish within the timeout is left exactly as-is 
-    (staged bytes + record file already on disk) and will be picked up by 
-    `recover_orphaned_files` on the next startup.
+    Bounded best-effort wait for in-flight tasks during graceful shutdown.
+
+    This is intentionally NOT the only safety net -- it is a courtesy that
+    lets fast-finishing work complete normally instead of being recovered
+    the slow way on next boot. Anything that doesn't finish within the
+    timeout is left exactly as-is (staged bytes + record file already on
+    disk) and will be picked up by `recover_orphaned_files` on the next
+    startup, so no special abandonment handling is needed here.
     """
     effective_timeout = timeout if timeout is not None else settings.extract_shutdown_drain_seconds
 

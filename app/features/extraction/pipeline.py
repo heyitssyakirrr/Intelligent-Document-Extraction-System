@@ -42,13 +42,37 @@ async def _record_failure(
     ctx.final_status = "failed"
     ctx.failed_stage = stage
     ctx.storage_status = "failure_written"
+    # From this point on the file is DURABLY recorded as failed: it has a
+    # row in failed.csv and a copy in failed_files/. Everything after this
+    # line is best-effort bookkeeping and must never be allowed to leave
+    # the lifecycle record unresolved (which would cause this same file to
+    # be recovered AGAIN -- and get a duplicate failed.csv row -- on the
+    # next startup).
     failed_pdf_path, failed_csv_path = await append_failure_row(pdf_bytes, ctx.filename, error_message)
     ctx.failed_pdf_path = str(failed_pdf_path)
     ctx.failed_csv_path = str(failed_csv_path)
     ctx.completed_at = datetime.now()
-    await append_file_summary(ctx)
+
     if ctx.intake_id:
-        await mark_terminal(ctx.intake_id, ctx.filename, "failed")
+        try:
+            await mark_terminal(ctx.intake_id, ctx.filename, "failed")
+        except Exception:
+            logger.exception(
+                "Failed to clear lifecycle record for '%s' (run=%s) after "
+                "recording its failure. The file IS recorded in failed.csv; "
+                "only its inflight staging copy may be cleaned up late.",
+                ctx.filename, ctx.processing_timestamp,
+            )
+
+    try:
+        await append_file_summary(ctx)
+    except Exception:
+        logger.exception(
+            "Failed to write summary log for '%s' (run=%s) after "
+            "recording its failure. The file IS recorded in failed.csv; "
+            "only the summary log entry is missing.",
+            ctx.filename, ctx.processing_timestamp,
+        )
 
 
 async def _run_ocr(ctx: FileProcessingContext, pdf_bytes: bytes) -> str:
@@ -124,7 +148,31 @@ async def _llm_stage(ctx: FileProcessingContext, ocr_text: str, pdf_bytes: bytes
             "Unexpected crash in _llm_stage for '%s' (run=%s): %s",
             ctx.filename, ctx.processing_timestamp, exc, exc_info=True,
         )
+        if ctx.final_status == "success":
+            # The file already has a durable row in extractions.csv (the
+            # success branch sets final_status="success" immediately after
+            # that write, and catches its own downstream errors locally --
+            # see _llm_stage_inner). If we ever land here with
+            # final_status already "success", something unexpected
+            # propagated past that local handling; log it loudly but NEVER
+            # write this file into failed.csv, or a user would see the
+            # same file recorded as both succeeded and failed.
+            logger.error(
+                "Crash occurred for '%s' (run=%s) AFTER it was already "
+                "recorded in extractions.csv -- NOT writing a failed.csv "
+                "row to avoid a contradictory duplicate record. Investigate "
+                "this log for the underlying cause.",
+                ctx.filename, ctx.processing_timestamp,
+            )
+            return
 
+        # _llm_stage_inner already records failures it anticipates (LLM
+        # retries exhausted, etc.) via _record_failure. This branch only
+        # runs for exceptions _llm_stage_inner did NOT anticipate (e.g. a
+        # bug somewhere before the success/failure write itself), which
+        # previously fell through to a summary-log-only write -- silently
+        # skipping failed.csv and the failed_files copy. Make sure those
+        # still happen so the file is never dropped from both CSVs.
         if ctx.final_status != "failed" or not ctx.failed_csv_path:
             try:
                 await _record_failure(
@@ -200,14 +248,43 @@ async def _llm_stage_inner(ctx: FileProcessingContext, ocr_text: str, pdf_bytes:
             attempt + 1,
             total_attempts,
         )
+        # From this point on the file is DURABLY a success: it has a row
+        # in extractions.csv. Nothing after this line may ever route it
+        # into _record_failure / failed.csv, no matter what fails next.
         csv_path = await append_success_row(result, ctx.filename)
         ctx.storage_status = "written"
         ctx.storage_output_path = str(csv_path)
         ctx.final_status = "success"
         ctx.completed_at = datetime.now()
-        await append_file_summary(ctx)
+
+        # mark_terminal happens immediately after the CSV write succeeds,
+        # not after the summary log, so a summary-log bug can never leave
+        # this file's lifecycle record unresolved (which would otherwise
+        # get it wrongly recovered into failed.csv as "interrupted" on the
+        # next startup, even though it already succeeded).
         if ctx.intake_id:
-            await mark_terminal(ctx.intake_id, ctx.filename, "success")
+            try:
+                await mark_terminal(ctx.intake_id, ctx.filename, "success")
+            except Exception:
+                logger.exception(
+                    "Failed to clear lifecycle record for '%s' (run=%s) "
+                    "after a successful extraction. The file IS recorded "
+                    "in extractions.csv; only its inflight staging copy "
+                    "may be cleaned up late.", ctx.filename, ctx.processing_timestamp,
+                )
+
+        # Summary log is best-effort logging, not part of the success
+        # contract -- a failure here must never change this file's
+        # outcome or cause it to be reported as failed anywhere.
+        try:
+            await append_file_summary(ctx)
+        except Exception:
+            logger.exception(
+                "Failed to write summary log for '%s' (run=%s) after a "
+                "successful extraction. The file IS recorded in "
+                "extractions.csv; only the summary log entry is missing.",
+                ctx.filename, ctx.processing_timestamp,
+            )
         return
 
     msg = f"LLM failed after {total_attempts} attempt(s): {_error_message(last_exc) if last_exc else 'unknown error'}"
@@ -276,11 +353,26 @@ _ocr_worker_task: asyncio.Task | None = None
 
 
 async def _recovery_record_failure(
+    intake_id: str,
     filename: str,
     pdf_bytes: bytes,
     stage: str,
     error_message: str,
 ) -> None:
+    """
+    Adapter passed into lifecycle.recover_orphaned_files so it can write a
+    recovered orphan into failed.csv / failed_files / the summary log using
+    the exact same storage.py code paths as a normal in-flight failure,
+    without lifecycle.py needing to import pipeline.py (which would create
+    app.features.extraction.lifecycle <-> app.features.extraction.pipeline
+    circular import, since pipeline.py already imports lifecycle.py).
+
+    mark_terminal is called immediately after append_failure_row succeeds,
+    not after the summary log -- mirroring _record_failure exactly -- so a
+    summary-log bug can never leave this orphan's record unresolved (which
+    would otherwise cause it to be "recovered" again, with a duplicate
+    failed.csv row, on every subsequent restart).
+    """
     now = datetime.now()
     ctx = FileProcessingContext(
         filename=filename,
@@ -296,7 +388,26 @@ async def _recovery_record_failure(
     ctx.failed_pdf_path = str(failed_pdf_path)
     ctx.failed_csv_path = str(failed_csv_path)
     ctx.completed_at = datetime.now()
-    await append_file_summary(ctx)
+
+    if intake_id:
+        try:
+            await mark_terminal(intake_id, filename, "failed")
+        except Exception:
+            logger.exception(
+                "Failed to clear lifecycle record for '%s' (intake_id=%s) "
+                "after recovering it. The file IS recorded in failed.csv; "
+                "only its inflight staging copy may be cleaned up late.",
+                filename, intake_id,
+            )
+
+    try:
+        await append_file_summary(ctx)
+    except Exception:
+        logger.exception(
+            "Failed to write summary log for recovered file '%s' "
+            "(intake_id=%s). The file IS recorded in failed.csv; only "
+            "the summary log entry is missing.", filename, intake_id,
+        )
 
 
 async def start_ocr_worker() -> None:
