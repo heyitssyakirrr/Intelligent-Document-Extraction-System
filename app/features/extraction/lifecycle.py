@@ -109,7 +109,7 @@ async def _update_record(intake_id: str, patch: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Public API: intake
+# intake
 # ---------------------------------------------------------------------------
 async def register_intake(filename: str, processing_timestamp: str, pdf_bytes: bytes) -> IntakeRecord:
     intake_id = uuid.uuid4().hex[:12]
@@ -133,7 +133,7 @@ async def register_intake(filename: str, processing_timestamp: str, pdf_bytes: b
 
 
 # ---------------------------------------------------------------------------
-# Public API: OCR-complete checkpoint (enables resume to skip OCR)
+# OCR-complete checkpoint (enables resume to skip OCR)
 # ---------------------------------------------------------------------------
 async def mark_ocr_complete(intake_id: str, ocr_output_path: str) -> None:
     if not intake_id:
@@ -149,7 +149,7 @@ async def mark_ocr_complete(intake_id: str, ocr_output_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Public API: terminal state + cleanup
+# terminal state + cleanup
 # ---------------------------------------------------------------------------
 async def mark_terminal(intake_id: str, filename: str, final_status: str) -> None:
     loop = asyncio.get_running_loop()
@@ -167,7 +167,7 @@ def _clear_inflight_sync(intake_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Public API: resume (re-enter the live pipeline instead of failing outright)
+# resume (re-enter the live pipeline instead of failing outright)
 # ---------------------------------------------------------------------------
 async def resume_interrupted_files(requeue_for_ocr_fn, requeue_for_llm_fn) -> int:
     loop = asyncio.get_running_loop()
@@ -191,14 +191,8 @@ async def resume_interrupted_files(requeue_for_ocr_fn, requeue_for_llm_fn) -> in
         ocr_output_path_str = record.get("ocr_output_path")
 
         if not inflight_path.exists():
-            # No staged PDF to resume from at all -- nothing safe to do
-            # here. Leave it for recover_orphaned_files, which will log
-            # and drop it (same handling as today for this exact case).
             continue
 
-        # Commit the one-shot flag BEFORE doing anything risky with this
-        # file, so a crash during the resume attempt itself can never
-        # cause a second resume on the next restart.
         try:
             await _update_record(intake_id, {"resume_attempted": True})
         except Exception:
@@ -234,10 +228,6 @@ async def resume_interrupted_files(requeue_for_ocr_fn, requeue_for_llm_fn) -> in
             try:
                 ocr_text = await loop.run_in_executor(None, ocr_output_path.read_text, "utf-8")
             except OSError:
-                # Checkpoint says OCR finished, but the txt is no longer
-                # readable (deleted by manual cleanup, retention, etc).
-                # Fall back to redoing OCR rather than losing the file --
-                # safe, just slightly slower than the ideal path.
                 logger.warning(
                     "OCR checkpoint exists for '%s' (intake_id=%s) but its "
                     "txt at %s is unreadable; resuming via OCR instead of "
@@ -257,13 +247,7 @@ async def resume_interrupted_files(requeue_for_ocr_fn, requeue_for_llm_fn) -> in
                 "OCR output found).", filename, intake_id,
             )
             await requeue_for_ocr_fn(ctx, pdf_bytes)
-
-        # Recorded as resumed only now -- after the flag was durably
-        # committed AND the requeue call was actually made. This is the
-        # set recover_orphaned_files must exclude this same startup, so a
-        # file just handed back into the pipeline isn't immediately
-        # treated as a still-unresolved orphan before it's had a chance
-        # to run.
+                                                                                  
         resumed_intake_ids.add(intake_id)
 
     return resumed_intake_ids
@@ -275,15 +259,8 @@ def _read_all_records_sync() -> list[dict[str, Any]]:
         try:
             records.append(json.loads(record_path.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
-            # A record file that is missing or unparseable (e.g. a hard
-            # kill landed mid-write, before the atomic rename in
-            # _write_record_sync completed) means that specific upload's
-            # bytes are still sitting in files/ but we cannot recover its
-            # filename/metadata. Log loudly; this affects only this one
-            # file, never any other record.
             logger.error(
-                "Inflight record at %s is missing or unreadable; the "
-                "corresponding staged file (if any) cannot be "
+                "Inflight record at %s is missing or unreadable; the corresponding staged file (if any) cannot be"
                 "auto-recovered into failed.csv.", record_path,
             )
     return records
@@ -316,13 +293,8 @@ async def recover_orphaned_files(
         filename = record.get("filename") or inflight_path.name or "unknown.pdf"
 
         if not inflight_path.exists():
-            # Record says "accepted" but the staged copy is gone (e.g.
-            # disk was cleared manually). Nothing to recover the bytes
-            # from; log it loudly, drop the stale record, and move on
-            # rather than retrying forever.
             logger.error(
-                "Orphaned record for '%s' (intake_id=%s) has no matching "
-                "staged file at %s -- cannot recover its bytes; leaving "
+                "Orphaned record for '%s' (intake_id=%s) has no matching staged file at %s -- cannot recover its bytes; leaving"
                 "it out of failed.csv.", filename, intake_id, inflight_path,
             )
             await loop.run_in_executor(None, _clear_inflight_sync, intake_id)
@@ -335,17 +307,11 @@ async def recover_orphaned_files(
                 filename,
                 pdf_bytes,
                 "resume_failed",
-                "Processing was interrupted by an application shutdown or "
-                "crash, and a previous automatic resume attempt also did "
-                "not complete. This file was not retried again "
-                "automatically; please re-upload it if needed.",
+                "Processing was interrupted by an application shutdown or crash, and a previous automatic resume attempt also did"
+                "not complete. This file was not retried again automatically; please re-upload it if needed.",
             )
             recovered += 1
         except Exception:
-            # Leave the record + staged file in place -- they will be
-            # retried on the NEXT startup rather than lost. Repeated
-            # failures here (e.g. disk full) are visible in logs each
-            # boot until resolved.
             logger.exception(
                 "Failed to recover orphaned file '%s' (intake_id=%s); will "
                 "retry on next startup.", filename, intake_id,
@@ -355,7 +321,7 @@ async def recover_orphaned_files(
 
 
 # ---------------------------------------------------------------------------
-# Public API: shutdown drain
+# shutdown drain
 # ---------------------------------------------------------------------------
 async def drain_and_finalize(pending_tasks: "set[asyncio.Task]", timeout: float | None = None) -> None:
     effective_timeout = timeout if timeout is not None else settings.extract_shutdown_drain_seconds

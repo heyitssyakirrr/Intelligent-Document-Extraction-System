@@ -1,0 +1,26 @@
+[Unit]
+Description=Intelligent Document Extraction System
+After=network.target
+
+[Service]
+Type=simple
+User=Username..
+Group=Group..
+WorkingDirectory=/dir/FileReader
+EnvironmentFile=/dir/FileReader/.env
+ExecStart=/dir/FileReader/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 5000 --workers 1
+Restart=on-failure
+RestartSec=5
+
+# The app's own shutdown handler (drain_and_finalize in main.py) waits up to
+# extract_shutdown_drain_seconds (default 30s in config.py) for in-flight
+# OCR/LLM tasks to finish before exiting.
+TimeoutStopSec=45
+KillSignal=SIGTERM
+
+# Basic hardening
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
