@@ -24,8 +24,26 @@ _RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
 _FAILED_ROOT.mkdir(parents=True, exist_ok=True)
 _OCR_OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
 
-_SUCCESS_CSV_HEADER = "timestamp,filename,bank_name,fi_num,master_account_number,sub_account_number\r\n"
+# to be used only in _append_success_row
+_COLUMN_WIDTHS = {
+    "timestamp": 26,
+    "filename": 15,
+    "bank_name": 20,
+    "fi_num": 10,
+    "master_account_number": 26,
+    "sub_account_number": 26,
+}
+
+_SUCCESS_CSV_HEADER = ",".join(
+    col.ljust(width) for col, width in _COLUMN_WIDTHS.items()
+).rstrip() + "\r\n"
+
 _FAILED_CSV_HEADER = "filename,error_message,timestamp\r\n"
+
+
+def _pad_field(value: str, width: int) -> str:
+    # ljust pads with trailing spaces so columnds line up in a monospace editor
+    return value.ljust(width)
 
 
 def _escape_csv_field(value: str | None) -> str:
@@ -43,14 +61,14 @@ async def append_success_row(result: ExtractionResult, filename: str) -> Path:
     today = now.strftime("%Y%m%d")
     csv_path = _RESULTS_ROOT / f"{today}_extractions.csv"
 
-    row = ",".join(_escape_csv_field(v) for v in [
-        timestamp,
-        filename,
-        result.bank_name,
-        result.fi_num,
-        result.master_account_number,
-        result.sub_account_number,
-    ]) + "\r\n"
+    row = ",".join(
+        _pad_field(_escape_csv_field(v), width)
+        for v, width in zip(
+            [timestamp, filename, result.bank_name, result.fi_num,
+             result.master_account_number, result.sub_account_number],
+             _COLUMN_WIDTHS.values(),
+        )
+    ) + "\r\n"
 
     async with _csv_append_lock:
         is_new_file = not csv_path.exists() or csv_path.stat().st_size == 0
