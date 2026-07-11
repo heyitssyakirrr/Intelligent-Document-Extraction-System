@@ -24,6 +24,10 @@ from app.features.extraction.lifecycle import (
     recover_orphaned_files,
     resume_interrupted_files,
 )
+from app.features.extraction.normalization import (
+    normalize_account_number,
+    normalize_fi_code,
+)
 from app.features.extraction.storage import append_failure_row, append_success_row, append_ocr_output
 from app.features.extraction.summary_logs import append_file_summary
 from app.features.prompt import build_extraction_prompt
@@ -142,9 +146,9 @@ async def _run_llm_extraction(ctx: FileProcessingContext, ocr_text: str) -> Extr
 
     return ExtractionResult(
         name=llm_result.get("name"),
-        master_account_number=llm_result.get("master_account_number"),
-        sub_account_number=llm_result.get("sub_account_number"),
-        fi_num=llm_result.get("fi_num"),
+        master_account_number=normalize_account_number(llm_result.get("master_account_number")),
+        sub_account_number=normalize_account_number(llm_result.get("sub_account_number")),
+        fi_num=normalize_fi_code(llm_result.get("fi_num")),
         bank_name=llm_result.get("bank_name"),
     )
 
