@@ -5,13 +5,13 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from FileReader.app.core.config import get_settings
-from FileReader.app.features.extraction.concurrency import _csv_append_lock
-from FileReader.app.features.extraction.retention import (
+from app.core.config import get_settings
+from app.features.extraction.concurrency import _csv_append_lock
+from app.features.extraction.retention import (
     enforce_dated_folder_retention,
     enforce_extractions_retention,
 )
-from FileReader.app.models.schemas import ExtractionResult
+from app.models.schemas import ExtractionResult
 
 logger = logging.getLogger(__name__)
 settings = get_settings()

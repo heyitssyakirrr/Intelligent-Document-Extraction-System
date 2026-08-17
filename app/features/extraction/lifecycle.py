@@ -11,8 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from FileReader.app.core.config import get_settings
-from FileReader.app.features.extraction.context import FileProcessingContext
+from app.core.config import get_settings
+from app.features.extraction.context import FileProcessingContext
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
