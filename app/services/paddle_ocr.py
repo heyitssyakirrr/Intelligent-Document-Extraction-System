@@ -43,13 +43,13 @@ def _get_ocr():
         }
         local_kwargs = {k: v for k, v in local_kwargs.items() if v is not None}
 
-    logger.info("Loading PaddleOCR (CPU)...")
+    logger.info("Loading PP-OCRv5 model (CPU)...")
     _ocr_instance = PaddleOCR(
         lang="en",
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
-        use_textline_orientation=False,
         use_angle_cls=True,
+        use_textline_orientation=False,
         text_det_thresh=0.3,
         text_det_box_thresh=0.5,
         text_det_unclip_ratio=1.8,
@@ -58,11 +58,6 @@ def _get_ocr():
         enable_mkldnn=False,
         **local_kwargs,
     )
-    logger.info("OCR detector model dir: %s", _ocr_instance.text_detector.args.det_model_dir)
-    logger.info("OCR recognizer model dir: %s", _ocr_instance.text_recognizer.args.rec_model_dir)
-    logger.info("OCR classifier model dir: %s", _ocr_instance.text_classifier.args.cls_model_dir if _ocr_instance.text_classifier else None)
-    logger.info("OCR version: %s", _ocr_instance.text_detector.args.ocr_version)
-    logger.info("OCR language: %s", _ocr_instance.text_detector.args.lang)
     logger.info("Model loaded.")
     return _ocr_instance
 
@@ -177,6 +172,111 @@ def _auto_deskew_image(img_array, max_skew_degrees: float = 10.0):
         return original
 
 
+def _extract_bbox_info(bbox_coords: list) -> tuple[float, float, float, float]:
+    """Extract bounding box coordinates from PaddleOCR format.
+    
+    PaddleOCR returns bbox as: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+    Returns: (min_x, min_y, max_x, max_y) for easier row/column grouping.
+    """
+    if not bbox_coords or len(bbox_coords) < 2:
+        return 0, 0, 0, 0
+    
+    xs = [coord[0] for coord in bbox_coords]
+    ys = [coord[1] for coord in bbox_coords]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _group_text_by_rows(page_results: list, y_threshold: float = 15) -> list[list[tuple[float, str]]]:
+    """Group detected text elements into rows based on Y-coordinate similarity.
+    
+    Args:
+        page_results: PaddleOCR results for one page
+        y_threshold: Maximum Y difference (in pixels) to consider text on same row
+    
+    Returns:
+        List of rows, where each row is a list of (x_position, text) tuples sorted left-to-right.
+    """
+    # Collect all text with position info
+    text_elements: list[tuple[float, float, str]] = []
+    
+    for line in page_results:
+        if line is None or len(line) < 2:
+            continue
+        
+        bbox = line[0]
+        text_info = line[1]
+        
+        if bbox is None or text_info is None:
+            continue
+        
+        min_x, min_y, max_x, max_y = _extract_bbox_info(bbox)
+        text = str(text_info[0]).strip()
+        
+        if text:
+            # Use midpoint of Y coordinates as the row indicator
+            y_mid = (min_y + max_y) / 2
+            x_mid = (min_x + max_x) / 2
+            text_elements.append((y_mid, x_mid, text))
+    
+    if not text_elements:
+        return []
+    
+    # Sort by Y position to process rows top-to-bottom
+    text_elements.sort(key=lambda t: t[0])
+    
+    # Group into rows based on Y proximity
+    rows: list[list[tuple[float, str]]] = []
+    current_row: list[tuple[float, str]] = []
+    current_y = None
+    
+    for y_mid, x_mid, text in text_elements:
+        if current_y is None:
+            current_y = y_mid
+            current_row.append((x_mid, text))
+        elif abs(y_mid - current_y) <= y_threshold:
+            # Same row
+            current_row.append((x_mid, text))
+        else:
+            # New row detected
+            if current_row:
+                rows.append(current_row)
+            current_row = [(x_mid, text)]
+            current_y = y_mid
+    
+    # Add the last row
+    if current_row:
+        rows.append(current_row)
+    
+    # Sort each row left-to-right by X coordinate
+    for row in rows:
+        row.sort(key=lambda t: t[0])
+    
+    return rows
+
+
+def _format_markdown_row(row: list[tuple[float, str]]) -> str:
+    texts = [text.replace("|", "\\|").replace("\n", " ").strip() for _, text in row]
+    texts = [text for text in texts if text]
+    if len(texts) == 1:
+        return texts[0]
+    return f"| {' | '.join(texts)} |"
+
+
+def _format_page_as_markdown(results: list, page_num: int) -> str:
+    page_lines: list[str] = []
+    for page_result in results:
+        if page_result is None:
+            continue
+        for row in _group_text_by_rows(page_result):
+            markdown_row = _format_markdown_row(row)
+            if markdown_row:
+                page_lines.append(markdown_row)
+
+    if not page_lines:
+        return ""
+    return f"# Page {page_num}\n\n" + "\n".join(page_lines)
+
+
 def process_pdf(pdf_path: str, dpi: int = 300) -> str:
     pdf_path = str(pdf_path)
     logger.info("Processing: %s at %d DPI", pdf_path, dpi)
@@ -184,7 +284,7 @@ def process_pdf(pdf_path: str, dpi: int = 300) -> str:
     images = _pdf_to_images(pdf_path, dpi=dpi)
     ocr = _get_ocr()
 
-    all_lines: list[str] = []
+    markdown_pages: list[str] = []
     t0 = time.time()
 
     for page_num, img_array in images:
@@ -202,17 +302,11 @@ def process_pdf(pdf_path: str, dpi: int = 300) -> str:
             logger.debug("Page %d: no text detected.", page_num)
             continue
 
-        for page_result in results:
-            if page_result is None:
-                continue
-            for line in page_result:
-                if line is None:
-                    continue
-                text_info = line[1]  # (text, confidence)
-                text = str(text_info[0]).strip()
-                if text:
-                    all_lines.append(text)
+        markdown_page = _format_page_as_markdown(results, page_num)
+        if markdown_page:
+            markdown_pages.append(markdown_page)
 
     elapsed = time.time() - t0
-    logger.info("Done in %.1fs — %d lines extracted", elapsed, len(all_lines))
-    return "\n".join(all_lines)
+    line_count = sum(page.count("\n") + 1 for page in markdown_pages)
+    logger.info("Done in %.1fs — %d Markdown lines extracted", elapsed, line_count)
+    return "\n\n".join(markdown_pages)
