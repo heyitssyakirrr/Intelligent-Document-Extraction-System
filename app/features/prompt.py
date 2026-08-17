@@ -243,6 +243,26 @@ MISTAKE 6 — fi_num and master swapped in Flat CCRIS table (Layout G):
   The RENTAS account is labelled under a "RENTAS" or "IBG" payment instruction
   block (e.g. "Account No. 309-909570-005") and belongs to the bank's internal
   clearing system. It will NOT appear inside the FI Code section.
+- LABEL MATCHING — use a wildcard pattern "MASTER * ACCOUNT" (and "MASTER * A/C",
+  "MASTER * NO"), not an exact-string match. The word(s) in the middle can vary
+  between documents — e.g. "MASTER ACCOUNT NO", "MASTER FIN ACCOUNT NUMBER",
+  "MASTER LOAN ACCOUNT NO", "MASTER FINANCING ACCOUNT NO" all refer to the SAME
+  field. Treat any label that starts with "MASTER" and ends with a word meaning
+  "ACCOUNT" / "A/C" / "NO" as the master account label, regardless of what
+  qualifier word sits in between.
+- PROXIMITY SEARCH FOR SKEWED/MISALIGNED OCR — because the source document is
+  often physically skewed or scanned at an angle, OCR can place the account
+  number's digits on the line immediately ABOVE or BELOW the "Master Account"
+  label instead of directly after it on the same line, even though in the real
+  document they are printed on the same line. If a line consisting ONLY of a
+  long digit/alphanumeric string appears directly before or after a line
+  containing a "MASTER * ACCOUNT" label (with no other label between them),
+  treat that number as belonging to the master account label and use it as
+  master_account_number, even though it is not on the same OCR line.
+  Example (number appears ABOVE the label due to skew):
+      123871298759812
+      master account number:
+      → master_account_number = "123871298759812"
 
 --- SUB ACCOUNT NUMBER ---
 - A secondary account number in the same section, listed after the master account.
@@ -344,6 +364,14 @@ STEP 1 — LOCATE THE FI CODE SECTION
   Search the entire document (top and bottom) for a section containing the words
   "FI CODE", "FI NUM", "FACILITY ACCOUNT", "ACCOUNT DETAILS", or "CCRIS".
   Also check any header table near the borrower/account details at the top.
+  When looking for the master account label, match the wildcard pattern
+  "MASTER * ACCOUNT" / "MASTER * A/C" / "MASTER * NO" rather than an exact
+  phrase — the middle word varies ("MASTER FIN ACCOUNT NUMBER", "MASTER LOAN
+  ACCOUNT NO", etc). If the line with this label has no number on it (or the
+  number looks cut off), do a PROXIMITY SEARCH: check the line immediately
+  above and the line immediately below for a standalone digit/alphanumeric
+  string — skewed scans often cause OCR to place the master account number on
+  an adjacent line even though it is on the same line in the original document.
 
 STEP 2 — DETECT THE LAYOUT
   Pipe characters (|) → Layout A: assign fi_num to the SHORTEST value in the row.
