@@ -5,33 +5,32 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from app.core.config import get_settings
-from app.features.extraction.concurrency import _csv_append_lock
-from app.features.extraction.retention import (
+from FileReader.app.core.config import get_settings
+from FileReader.app.features.extraction.concurrency import _csv_append_lock
+from FileReader.app.features.extraction.retention import (
     enforce_dated_folder_retention,
     enforce_extractions_retention,
 )
-from app.models.schemas import ExtractionResult
+from FileReader.app.models.schemas import ExtractionResult
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-_RESULTS_ROOT = Path("results")
-_FAILED_ROOT = Path("failed")
-_OCR_OUTPUTS_ROOT = Path("OCR_Outputs")
+_RESULTS_ROOT = Path("FileReader","results")
+_FAILED_ROOT = Path("FileReader","failed")
+_OCR_OUTPUTS_ROOT = Path("FileReader","OCR_Outputs")
 
 _RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
 _FAILED_ROOT.mkdir(parents=True, exist_ok=True)
 _OCR_OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
 
-# to be used only in _append_success_row
 _COLUMN_WIDTHS = {
-    "timestamp": 26,
-    "filename": 15,
-    "bank_name": 20,
-    "fi_num": 10,
-    "master_account_number": 26,
-    "sub_account_number": 26,
+    "timestamp": 20,
+    "filename": 18,
+    "bank_name": 35,
+    "fi_num": 11,
+    "master_account_number": 30,
+    "sub_account_number": 30,
 }
 
 _SUCCESS_CSV_HEADER = ",".join(
@@ -42,9 +41,8 @@ _FAILED_CSV_HEADER = "filename,error_message,timestamp\r\n"
 
 
 def _pad_field(value: str, width: int) -> str:
-    # ljust pads with trailing spaces so columnds line up in a monospace editor
+    #ljust pads with trailing spaces so columns line up in a monospace editor
     return value.ljust(width)
-
 
 def _escape_csv_field(value: str | None) -> str:
     if value is None:
@@ -95,15 +93,7 @@ def _write_failure_sync(
     files_folder = day_folder / "failed_files"
     files_folder.mkdir(parents=True, exist_ok=True)
 
-    # Disambiguate by time-of-day so two failures sharing the same original
-    # filename on the same day never overwrite each other's copy.
-    time_part = timestamp.split("T", 1)[-1].replace(":", "")
-    original_name = Path(filename).name
-    dest_pdf = files_folder / f"{time_part}__{original_name}"
-    suffix = 1
-    while dest_pdf.exists():
-        dest_pdf = files_folder / f"{time_part}_{suffix}__{original_name}"
-        suffix += 1
+    dest_pdf = files_folder / Path(filename).name
     dest_pdf.write_bytes(pdf_bytes)
 
     csv_path = day_folder / "failed.csv"
