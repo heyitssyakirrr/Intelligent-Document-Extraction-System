@@ -41,6 +41,26 @@ Your task is to extract exactly five fields from a bank document.
 1. Return ONLY a raw JSON object — no markdown, no code blocks, no explanation.
 2. Use the full context of the document to determine the correct values.
 3. Do NOT repeat or explain the fields. Output the JSON object and nothing else.
+4. MASKED / PLACEHOLDER VALUES: If the value printed in the document for fi_num,
+   master_account_number, or sub_account_number is masked or redacted (e.g. a run
+   of "X" characters like "XXXXXXXXX", "XXXX12345", or asterisks), copy that
+   masked value EXACTLY as printed, X's and all. Do NOT invent, guess, or
+   substitute a real-looking number in its place. Do NOT pull digits from
+   somewhere else in the document just because they look like a plausible ID.
+   Do NOT reuse any sample/example values shown anywhere in these instructions
+   (e.g. "022612078", "88820006220322") — those are illustrations only and will
+   NEVER be the correct answer for an actual document. Only text that literally
+   appears in the DOCUMENT section below is a valid value.
+5. NO EXPLANATORY TEXT INSIDE A VALUE: An identifier/code/account number is a
+   single token of letters, digits, slashes, hyphens, or underscores. If any
+   word or phrase with independent meaning appears next to it — a product or
+   facility type such as "(Term Loan)", "(Term Financing-i)", "Housing Loan",
+   etc. — whether in parentheses, after a dash, or just trailing on the same
+   line — that word/phrase is a DESCRIPTION, not part of the value. Take only
+   the identifier itself and drop the descriptive words entirely. This does
+   NOT apply to short alphanumeric suffixes that are printed run-together with
+   no space as part of the code itself (e.g. "O/D88" in "205340722O/D88") —
+   those stay attached; only drop words/phrases that read as a description.
 
 ================================================================================
 FIELD 1 — NAME
@@ -219,6 +239,23 @@ MISTAKE 6 — fi_num and master swapped in Flat CCRIS table (Layout G):
   Why: The shortest number (9 digits) is ALWAYS fi_num. The longest is ALWAYS master.
        Never assign a 20+ digit number to fi_num.
 
+MISTAKE 7 — inventing a value for a masked/redacted field:
+  Document:  FI CODE : XXXXXXXXX
+  WRONG:  fi_num="034907013"  (an invented or example-looking number)
+  RIGHT:  fi_num="XXXXXXXXX"
+  Why: The document itself shows the value is masked. Copy exactly what is
+       printed — never substitute a real-looking number, and never reuse a
+       sample number from these instructions or from elsewhere in the document.
+
+MISTAKE 8 — descriptive text captured together with the code:
+  Document:  FI Code: 012345678 (Term Loan)
+  WRONG:  fi_num="012345678 (Term Loan)"
+  RIGHT:  fi_num="012345678"
+  Why: "(Term Loan)" describes the facility type, not the code. Any word or
+       phrase with its own meaning next to a value (parenthesized, dashed, or
+       trailing) is a description and must be dropped — keep only the
+       identifier itself.
+
 --- FI CODE (fi_num) ---
 - A short institution/routing code — typically either 9 characters with only 9 digits or 
   10 characters with 9 digits and 1 underscore or 1 hyphen.
@@ -229,6 +266,10 @@ MISTAKE 6 — fi_num and master swapped in Flat CCRIS table (Layout G):
 - NOT a phone number, postcode, reference number, or RENTAS clearing account.
 - If multiple comma-separated candidates exist, choose the one starting with 0 or 3.
 - If unsure between two candidates, choose the shorter purely-numeric one.
+- If the printed value is masked/redacted (a run of "X" characters or asterisks),
+  copy it exactly as printed — do NOT invent a real number in its place.
+- Strip any descriptive word or phrase printed next to the code (e.g.
+  "(Term Loan)", "(Term Financing-i)") — take only the code itself.
 
 --- MASTER ACCOUNT NUMBER ---
 - The primary loan/account identifier for the third-party bank.
@@ -239,6 +280,8 @@ MISTAKE 6 — fi_num and master swapped in Flat CCRIS table (Layout G):
   the FIRST value only.
 - Strip any parenthetical descriptors such as "(Term Financing-i)" that follow
   the account number — copy only the account identifier itself.
+- If the printed value is masked/redacted (a run of "X" characters or
+  asterisks), copy it exactly as printed — do NOT invent a real number.
 - NEVER use the RENTAS/IBG payment account as the master account.
   The RENTAS account is labelled under a "RENTAS" or "IBG" payment instruction
   block (e.g. "Account No. 309-909570-005") and belongs to the bank's internal
@@ -273,6 +316,8 @@ MISTAKE 6 — fi_num and master swapped in Flat CCRIS table (Layout G):
 - If multiple comma-separated values appear on the sub account line, take the
   FIRST value only; strip any leading colon or punctuation character.
 - Strip any parenthetical descriptors such as "(Term Financing-i)".
+- If the printed value is masked/redacted (a run of "X" characters or
+  asterisks), copy it exactly as printed — do NOT invent a real number.
 - COMBINED LABEL RULE: If the document uses a combined label such as
   "MASTER / SUB ACCOUNT NO." or "MASTER/SUB ACCOUNT NO" followed by a single
   account number, then BOTH master_account_number AND sub_account_number are
@@ -435,9 +480,17 @@ FINAL VALIDATION GATE — answer these before writing the JSON
    master AND sub set to the same single account value? If not → STOP, they are the same value.
 6. Is sub_account_number something other than a standalone digit like "2" or "1"?
    If it's a single digit → STOP, that is a footnote, re-read for the real sub.
-7. Is the RENTAS/IBG clearing account being used as master? If yes → STOP, 
+7. Is the RENTAS/IBG clearing account being used as master? If yes → STOP,
    use the value in the FI Code section instead.
-Only write the JSON after all 7 checks pass.
+8. Does any of the three values contain a descriptive word or phrase (e.g.
+   "Term Loan", "Term Financing-i", "Housing Loan") attached to it? If yes →
+   STOP, remove the descriptive text and keep only the identifier itself.
+9. If the document shows a masked/redacted value (a run of "X" characters or
+   asterisks) for any of the three fields, did you copy it exactly as shown
+   instead of inventing a real-looking number or reusing a sample number from
+   these instructions? If you invented a number → STOP, replace it with the
+   masked value exactly as printed.
+Only write the JSON after all 9 checks pass.
 ================================================================================
 
 ================================================================================
