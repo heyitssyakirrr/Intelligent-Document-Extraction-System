@@ -1,5 +1,8 @@
+import os
 from functools import lru_cache
-from pydantic import field_validator
+from typing import Literal
+
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -7,6 +10,7 @@ class Settings(BaseSettings):
     app_name: str = "LLM Extraction Service"
     app_version: str = "1.0.0"
     debug: bool = False
+    server_env: Literal["PROD", "UAT"]
 
     # ---------------------------------------------------------------------------
     # LLM microservice configuration
@@ -23,9 +27,24 @@ class Settings(BaseSettings):
     max_tokens: int = 2048
 
     # ---------------------------------------------------------------------------
+    # DB2 (ELDS) connection — values come from .env / environment, never code
+    # ---------------------------------------------------------------------------
+    db2_database: str
+    db2_hostname: str
+    db2_port: int = 50000
+    # Toggle: "password" = UID + decrypted password, "gmsa" = Kerberos ticket of the gMSA account.
+    db2_auth_mode: Literal["password", "gmsa"] = "password"
+    db2_uid: str = ""
+    # Optional: if set, `kinit` is run from this keytab before connecting (leave empty if tickets are managed externally).
+    db2_gmsa_keytab: str = ""
+    db2_gmsa_principal: str = ""
+
+    # ---------------------------------------------------------------------------
     # PaddleOCR (in-process) configuration
     # ---------------------------------------------------------------------------
     ocr_timeout_seconds: float = 300.0
+    # "median" stops consecutive lines merging into one row; "legacy" is the original grouping.
+    ocr_row_grouping: Literal["legacy", "median"] = "legacy"
 
     # ---------------------------------------------------------------------------
     # Input safety
@@ -37,20 +56,21 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------------
     allowed_upload_extensions: list[str] = [".pdf"]
     max_upload_bytes: int = 10 * 1024 * 1024  # 10 MB
+    max_pdf_pages: int = 6
 
-    max_files_per_batch: int = 500 # not used since no more batch processing
+    max_files_per_batch: int = 500
 
     # ---------------------------------------------------------------------------
     # /extract — "Submit & Forget" concurrency cap/rate limiting
     # ---------------------------------------------------------------------------
-    extract_max_pending_tasks: int = 50
+    extract_max_pending_tasks: int = 350
 
     # Seconds to wait for in-flight single-extraction tasks to finish during
     # graceful shutdown before giving up and letting the process exit anyway.
     extract_shutdown_drain_seconds: float = 30.0
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file="FileReader/.env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore"
@@ -59,7 +79,7 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------------
     # File retention (results / failed / OCR outputs)
     # ---------------------------------------------------------------------------
-    retention_max_days: int = 90
+    retention_max_days: int = 30
 
     # ------------------------------------------------------------------
     # Validators
@@ -104,6 +124,14 @@ class Settings(BaseSettings):
             raise ValueError("retention_max_days must be positive")
         return v
 
+    @model_validator(mode="after")
+    def _check_db2_auth(self) -> "Settings":
+        if self.db2_auth_mode == "password" and not self.db2_uid:
+            raise ValueError("db2_uid is required when db2_auth_mode='password'")
+        if self.db2_auth_mode == "gmsa" and self.db2_gmsa_keytab and not self.db2_gmsa_principal:
+            raise ValueError("db2_gmsa_principal is required when db2_gmsa_keytab is set")
+        return self
+
     # ------------------------------------------------------------------
     # Computed properties
     # ------------------------------------------------------------------
@@ -112,6 +140,17 @@ class Settings(BaseSettings):
         return f"{self.llm_base_url}{self.llm_extract_endpoint}"
 
 
+_SERVER_ENVS = ("PROD", "UAT")
+
+
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    # SERVER_ENV comes from the venv's bin/activate (or the systemd unit's Environment=).
+    server_env = os.getenv("SERVER_ENV", "").strip().upper()
+    if server_env not in _SERVER_ENVS:
+        raise RuntimeError(f"SERVER_ENV must be one of {_SERVER_ENVS}, got {server_env}")
+    # Later files override earlier ones: shared .env first, then .env.prod / .env.uat.
+    return Settings(
+        _env_file=("FileReader/.env", f"FileReader/.env.{server_env.lower()}"),
+        server_env=server_env,
+    )
