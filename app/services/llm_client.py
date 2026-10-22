@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import httpx
 from fastapi import HTTPException
 
-from app.core.config import get_settings
+from FileReader.app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +128,13 @@ def _filter_expected_keys(d: dict) -> dict:
     return {k: v for k, v in d.items() if k in _EXPECTED_KEYS}
 
 
+def _clean_fi_num(result: dict) -> dict:
+    value = result.get("fi_num")
+    if isinstance(value, str):
+        result["fi_num"] = re.sub(r"[^0-9A-Za-z]", "", value)
+    return result
+
+
 def _metadata_for_result(
     result: dict,
     parse_strategy: str,
@@ -154,7 +161,11 @@ def _metadata_for_result(
 def _normalize_llm_output(response_json: dict) -> tuple[dict, LLMExtractionMetadata]:
     try:
         if "choices" in response_json:
-            raw = response_json["choices"][0]["message"]["content"].strip()
+            content = response_json["choices"][0]["message"].get("content")
+            if content is None:
+                logger.warning("LLM response has null content. Full response: %s", response_json)
+                raise ValueError("LLM returned null content in choices[0].message.content.")
+            raw = content.strip()
         elif "text" in response_json:
             raw = response_json["text"].strip()
         else:
@@ -163,7 +174,7 @@ def _normalize_llm_output(response_json: dict) -> tuple[dict, LLMExtractionMetad
         code_blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
         if code_blocks:
             parsed = json.loads(_strip_trailing_commas(code_blocks[-1]))
-            result = _filter_expected_keys(_normalise_keys(parsed))
+            result = _clean_fi_num(_filter_expected_keys(_normalise_keys(parsed)))
             metadata = _metadata_for_result(result, "code_block", len(code_blocks), False)
             return result, metadata
 
@@ -174,7 +185,9 @@ def _normalize_llm_output(response_json: dict) -> tuple[dict, LLMExtractionMetad
                 try:
                     parsed = json.loads(_strip_trailing_commas(block))
                     if isinstance(parsed, dict):
-                        parsed_dicts.append(_filter_expected_keys(_normalise_keys(parsed)))
+                        parsed_dicts.append(
+                            _clean_fi_num(_filter_expected_keys(_normalise_keys(parsed)))
+                        )
                 except json.JSONDecodeError as exc:
                     logger.warning("Failed to parse one LLM JSON block: %s", exc)
                     continue
@@ -191,7 +204,7 @@ def _normalize_llm_output(response_json: dict) -> tuple[dict, LLMExtractionMetad
         last_json = _extract_last_json_object(repaired)
         if last_json:
             parsed = json.loads(_strip_trailing_commas(last_json))
-            result = _filter_expected_keys(_normalise_keys(parsed))
+            result = _clean_fi_num(_filter_expected_keys(_normalise_keys(parsed)))
             metadata = _metadata_for_result(result, "truncation_repair", 1, response_truncated)
             return result, metadata
 
