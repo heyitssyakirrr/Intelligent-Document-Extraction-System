@@ -41,26 +41,15 @@ Your task is to extract exactly five fields from a bank document.
 1. Return ONLY a raw JSON object — no markdown, no code blocks, no explanation.
 2. Use the full context of the document to determine the correct values.
 3. Do NOT repeat or explain the fields. Output the JSON object and nothing else.
-4. MASKED / PLACEHOLDER VALUES: If the value printed in the document for fi_num,
-   master_account_number, or sub_account_number is masked or redacted (e.g. a run
-   of "X" characters like "XXXXXXXXX", "XXXX12345", or asterisks), copy that
-   masked value EXACTLY as printed, X's and all. Do NOT invent, guess, or
-   substitute a real-looking number in its place. Do NOT pull digits from
-   somewhere else in the document just because they look like a plausible ID.
-   Do NOT reuse any sample/example values shown anywhere in these instructions
-   (e.g. "022612078", "88820006220322") — those are illustrations only and will
-   NEVER be the correct answer for an actual document. Only text that literally
-   appears in the DOCUMENT section below is a valid value.
-5. NO EXPLANATORY TEXT INSIDE A VALUE: An identifier/code/account number is a
-   single token of letters, digits, slashes, hyphens, or underscores. If any
-   word or phrase with independent meaning appears next to it — a product or
-   facility type such as "(Term Loan)", "(Term Financing-i)", "Housing Loan",
-   etc. — whether in parentheses, after a dash, or just trailing on the same
-   line — that word/phrase is a DESCRIPTION, not part of the value. Take only
-   the identifier itself and drop the descriptive words entirely. This does
-   NOT apply to short alphanumeric suffixes that are printed run-together with
-   no space as part of the code itself (e.g. "O/D88" in "205340722O/D88") —
-   those stay attached; only drop words/phrases that read as a description.
+4. HARD CONSTRAINT ON fi_num — this overrides every other rule below, including
+   any "shortest value" heuristic:
+     * Strip underscores and hyphens, then COUNT THE DIGITS.
+     * fi_num MUST contain EXACTLY 9 digits. Not 8. Not 10. Not 14. Not 26.
+     * Every character must be a digit, and the first must be 0 or 3.
+   If no candidate in the document satisfies both conditions, return null for
+   fi_num. Returning null is CORRECT. Returning a value with the wrong digit
+   count is ALWAYS WRONG, even if it was the shortest value on the line, even
+   if it sat directly after the words "FI CODE".
 
 ================================================================================
 FIELD 1 — NAME
@@ -87,20 +76,28 @@ The section ALWAYS lists the three values with these logical roles:
     Master Account No.   → master_account_number
     Sub Account No.      → sub_account_number
 
-This section appears in ONE OF SEVEN layouts. Detect which one is present:
+This section appears in ONE OF SIX layouts. Detect which one is present:
 
 --- LAYOUT A: pipe/markdown table ---
 All three values appear as cells in a single table row.
-The SHORTEST purely-numeric value in the row is ALWAYS the fi_num, regardless
-of column position. The table header or column order may differ between documents.
-Example (fi_num on the right because it is shorter):
+The fi_num is the cell containing EXACTLY 9 digits and starting with 0 or 3,
+regardless of column position. The table header or column order may differ
+between documents. Count the digits — do not judge by position or by which
+cell merely looks shorter.
+Example (fi_num on the right — 9 digits):
     | 71259000031266 | 021812590 |
-      ^master_acc      ^fi_num
-Example (fi_num on the left):
+      ^master_acc      ^fi_num (9 digits, starts with 0)
+Example (fi_num on the left — 9 digits):
     | 022204026 | 205340722O/D88 | 342385069101SLUMYR |
       ^fi_num     ^master_acc      ^sub_acc
-Always assign fi_num to the SHORTEST value. If only two values appear in the
-table row, there is no sub account — return the value of master_account_number for sub_account_number.
+      9 digits
+If NO cell in the row has exactly 9 digits, fi_num is null. If only two values
+appear in the table row, there is no sub account — return the value of
+master_account_number for sub_account_number.
+Only "|" separates columns. A "/" inside a header joins two names into ONE
+column — e.g. "Master /Sub account" is a single column meaning master = sub.
+The FI code may appear more than once (e.g. "021810037" and "[021810037");
+every copy is the FI code, never an account number.
 
 --- LAYOUT B: labeled key-value lines ---
 Each value has its own line with an explicit label.
@@ -137,7 +134,7 @@ Some documents show the account number first (under "Account No" or "Account(s)"
 and the FI code on a separate line below it, with no "Master/Sub" label split.
 In this case both master and sub account are the SAME value — the account number
 shown under "Account(s)". The FI code appears below it labelled "Fi Code" or
-"FI CODE" and is the shorter value starting with 0 or 3.
+"FI CODE" and has exactly 9 digits starting with 0 or 3.
 CRITICAL: Do NOT assign the FI code value to master/sub account, and do NOT
 assign the account number to fi_num. Use the LABEL to determine the role,
 not the position or length when labels are present.
@@ -158,7 +155,7 @@ separated by commas. Take values as follows:
     - sub_account_number  ← from the "CCRIS Sub-Account No" line:
                             take the FIRST value before the first comma;
                             strip any leading colon or punctuation character
-Example:
+  Example:
     CCRIS Fl Code             : 1035312016, 035312016
     CCRIS Master Account No.  : 120 116000030001 22981DS1001, 120 116000030001 22981DS6001
     CCRIS Sub-Account No.     : 620100052154291, 620100052154309
@@ -166,19 +163,32 @@ Example:
     → master_account_number = "120 116000030001 22981DS1001"  (first value, exact)
     → sub_account_number = "620100052154291"  (first value, strip leading colon)
 
+IMPORTANT: If a table has a combined "Master/Sub account" column header with
+multiple rows (each row showing different account values), use ONLY the FIRST
+row's account value for BOTH master_account_number AND sub_account_number.
+  Ignore later rows for this extraction; this rule does NOT apply to separate
+  master and sub labels/columns, which retain their own values.
+Example:
+    | Account(s) | Master/Sub account | FICODE |
+    | 71435200014492 | 021814352 |  ← FIRST row → master = 71435200014492
+    | 71435200014506 | 021814352 |  ← second row → ignore, don't use for sub
+    → master_account_number = "71435200014492"
+    → sub_account_number = "71435200014492" (same as master, NOT 71435200014506)
+    → fi_num = "021814352"
+
 --- LAYOUT G: Flat CCRIS table (two raw lines, no structure) ---
 PaddleOCR cannot preserve table columns. A CCRIS table becomes two flat lines:
   Line 1 (header): contains the words "FI", "Master", "Sub" in left-to-right order
   Line 2 (values): three numbers separated by spaces on a single line
 
 The values appear in the SAME LEFT-TO-RIGHT ORDER as their column headers:
-  Position 1 (leftmost)  → FI Code           → SHORTEST number (~9-10 chars)
+  Position 1 (leftmost)  → FI Code           → the 9-digit number
   Position 2 (middle)    → Master Account No. 
   Position 3 (rightmost) → Sub Account No.    
 
-Use digit LENGTH as the authoritative tiebreaker — do NOT rely on position alone:
-  fi_num                = the shortest number (9-10 chars, starts with 0 or 3)
-  master_account_number = the longest number
+Use digit COUNT as the authoritative test — do NOT rely on position alone:
+  fi_num                = the number with EXACTLY 9 digits, starting with 0 or 3
+  master_account_number = the longest remaining number
   sub_account_number    = the remaining number
 
 CRITICAL: The header labels tell you the column ORDER, not the values.
@@ -187,9 +197,9 @@ The values are on the NEXT line. Never confuse header words with account numbers
 Example:
   Line 1: "FICode Master Act Number Sub Act.Number"
   Line 2: "034707062 00000060729028921708888001 0000000406070003660"
-  → fi_num                = "034707062"                  (9 digits — shortest)
+  → fi_num                = "034707062"                  (9 digits — exact match)
   → master_account_number = "00000060729028921708888001"  (26 digits — longest)
-  → sub_account_number    = "0000000406070003660"         (16 digits — middle)
+  → sub_account_number    = "0000000406070003660"         (19 digits — remaining)
 
 In ALL layouts the logical roles are:
     fi_num → master_account_number → sub_account_number
@@ -203,7 +213,8 @@ MISTAKE 1 — fi_num and master swapped (Layout A pipe table):
   Document:  | 88820006220322 | 034907013 |
   WRONG:  fi_num="88820006220322"  master="034907013"
   RIGHT:  fi_num="034907013"       master="88820006220322"
-  Why: 034907013 is 9 chars starting with 0 → it is ALWAYS the fi_num.
+  Why: 034907013 has exactly 9 digits and starts with 0 → it is the fi_num.
+       88820006220322 has 14 digits, so it can never be the fi_num.
 
 MISTAKE 2 — Layout D, sub account copied from master instead of (c) line:
   Document:
@@ -236,40 +247,54 @@ MISTAKE 6 — fi_num and master swapped in Flat CCRIS table (Layout G):
     "034707062 00000060729028921708888001 0000000406070003660"
   WRONG:  fi_num="00000060729028921708888001"  master="034707062"
   RIGHT:  fi_num="034707062"  master="00000060729028921708888001"  sub="0000000406070003660"
-  Why: The shortest number (9 digits) is ALWAYS fi_num. The longest is ALWAYS master.
-       Never assign a 20+ digit number to fi_num.
+  Why: Only "034707062" has exactly 9 digits, so only it can be fi_num.
+       Never assign a number with more than 9 digits to fi_num.
 
-MISTAKE 7 — inventing a value for a masked/redacted field:
-  Document:  FI CODE : XXXXXXXXX
-  WRONG:  fi_num="034907013"  (an invented or example-looking number)
-  RIGHT:  fi_num="XXXXXXXXX"
-  Why: The document itself shows the value is masked. Copy exactly what is
-       printed — never substitute a real-looking number, and never reuse a
-       sample number from these instructions or from elsewhere in the document.
+MISTAKE 7 — a long value assigned to fi_num because it was the shortest on the line:
+  Document:  | 21201300122459 | 71259000031266 |
+  WRONG:  fi_num="21201300122459"  (14 digits — chosen only because it looked shorter)
+  RIGHT:  fi_num=null
+  Why: NEITHER value has 9 digits, and neither starts with 0 or 3. "Shortest"
+       is only a tiebreaker BETWEEN valid 9-digit candidates — it can never
+       promote an invalid candidate. When nothing qualifies, return null.
 
-MISTAKE 8 — descriptive text captured together with the code:
-  Document:  FI Code: 012345678 (Term Loan)
-  WRONG:  fi_num="012345678 (Term Loan)"
-  RIGHT:  fi_num="012345678"
-  Why: "(Term Loan)" describes the facility type, not the code. Any word or
-       phrase with its own meaning next to a value (parenthesized, dashed, or
-       trailing) is a description and must be dropped — keep only the
-       identifier itself.
+MISTAKE 8 — product description glued onto the account number:
+  Document:  MASTER ACCOUNT NO : 7114160292-00000(Term Loan)
+  WRONG:  master="7114160292-00000(Term Loan)"
+  WRONG:  master="7114160292-00000 Term Loan"
+  RIGHT:  master="7114160292-00000"
+  Why: "Term Loan" is the facility/product description, not part of the account
+       number. It must be removed together with its brackets, even when OCR
+       leaves no space before the opening bracket. The same applies to
+       "(Term Financing-i)", "(Housing Loan)", "[Overdraft]", "- Term Loan",
+       "Term Financing-i" and any similar trailing wording.
+
+MISTAKE 9 — FI code reused as the sub account ("/" mistaken for a column):
+  Document:  Account(s) : | Master /Sub account | FI CODE* |
+             | 71003700011898 | 021810037 |
+  OCR may flatten it into one row, and the FI code may appear twice:
+             | Master /Sub account | 71003700011898 | 021810037 | [021810037 | FICODE* |
+  WRONG:  fi_num="021810037"  master="71003700011898"  sub="021810037"
+  RIGHT:  fi_num="021810037"  master="71003700011898"  sub="71003700011898"
+  Why: "Master /Sub account" is ONE combined column ("/" is not a column
+       separator), so master = sub. Every copy of the FI code is still the
+       FI code — it is never an account number.
 
 --- FI CODE (fi_num) ---
-- A short institution/routing code — typically either 9 characters with only 9 digits or 
-  10 characters with 9 digits and 1 underscore or 1 hyphen.
-- USUALLY the shortest of the three values except for Standard Chartered Bank it is the longest 
-  (9 chars for fi_num while 8 chars for master_account_number and sub_account_number).
-- Starts with 0 (most banks) or 3 (BSN, Bank Rakyat). NEVER starts with other number than 0 or 3.
-- May contain underscores or hyphens (Maybank only): "0227_13014", "0227-11038".
+- A short institution/routing code containing EXACTLY 9 digits.
+- Written either as 9 characters ("034907013") or as 10 characters where one
+  character is an underscore or hyphen (Maybank only): "0227_13014", "0227-11038".
+  Strip the separator before counting: both forms have 9 digits.
+- Starts with 0 (most banks) or 3 (BSN, Bank Rakyat). NEVER starts with any other digit.
+- It is usually the shortest of the three values, but LENGTH RANKING IS NOT THE
+  TEST — the 9-digit count is. For Standard Chartered Bank the master and sub
+  accounts are only 8 characters, so fi_num is the LONGEST value there and is
+  still 9 digits. Always count digits; never assume "shortest wins".
 - NOT a phone number, postcode, reference number, or RENTAS clearing account.
-- If multiple comma-separated candidates exist, choose the one starting with 0 or 3.
-- If unsure between two candidates, choose the shorter purely-numeric one.
-- If the printed value is masked/redacted (a run of "X" characters or asterisks),
-  copy it exactly as printed — do NOT invent a real number in its place.
-- Strip any descriptive word or phrase printed next to the code (e.g.
-  "(Term Loan)", "(Term Financing-i)") — take only the code itself.
+- If multiple comma-separated candidates exist, choose the one with 9 digits
+  starting with 0 or 3.
+- If NO candidate anywhere in the document has exactly 9 digits and starts with
+  0 or 3, return null. Never stretch a 12-, 14- or 26-digit value into this field.
 
 --- MASTER ACCOUNT NUMBER ---
 - The primary loan/account identifier for the third-party bank.
@@ -278,10 +303,22 @@ MISTAKE 8 — descriptive text captured together with the code:
   slashes, dashes, spaces, and suffixes (e.g. "120 116000030001 22981DS1001").
 - If multiple comma-separated values appear on the master account line, take
   the FIRST value only.
-- Strip any parenthetical descriptors such as "(Term Financing-i)" that follow
-  the account number — copy only the account identifier itself.
-- If the printed value is masked/redacted (a run of "X" characters or
-  asterisks), copy it exactly as printed — do NOT invent a real number.
+- STOP AT THE ACCOUNT NUMBER — never include descriptive words. The account
+  number ends as soon as a facility/product description begins. Remove ALL of
+  the following, whether or not a space separates them from the number:
+    * anything inside brackets: "(Term Loan)", "(Term Financing-i)",
+      "(Housing Loan)", "[Overdraft]", "(HL)" — remove the brackets and their
+      contents. OCR often glues them on: "7114160292-00000(Term Loan)".
+    * trailing descriptive words even without brackets, e.g. "Term Loan",
+      "Term Financing-i", "Home Financing", "Overdraft", "Loan", "Financing",
+      "Facility", "Account", "a/c", "OD", "HL", and anything after a trailing
+      dash/colon that is a word rather than digits.
+  Example: "7114160292-00000(Term Loan)" → "7114160292-00000"
+- KEEP genuine alphanumeric parts of the account number itself. These are NOT
+  descriptions and must be preserved exactly: "205340722O/D88",
+  "342385069101SLUMYR", "120 116000030001 22981DS1001". The test is: if the
+  characters form an inseparable code/suffix of the account identifier, keep
+  them; if they read as an English/Malay description of the facility, drop them.
 - NEVER use the RENTAS/IBG payment account as the master account.
   The RENTAS account is labelled under a "RENTAS" or "IBG" payment instruction
   block (e.g. "Account No. 309-909570-005") and belongs to the bank's internal
@@ -315,9 +352,10 @@ MISTAKE 8 — descriptive text captured together with the code:
 - Copy EXACTLY as printed.
 - If multiple comma-separated values appear on the sub account line, take the
   FIRST value only; strip any leading colon or punctuation character.
-- Strip any parenthetical descriptors such as "(Term Financing-i)".
-- If the printed value is masked/redacted (a run of "X" characters or
-  asterisks), copy it exactly as printed — do NOT invent a real number.
+- Apply the SAME "stop at the account number" rule as the master account:
+  remove bracketed descriptors such as "(Term Loan)" / "(Term Financing-i)"
+  (including when glued on with no space) and any trailing descriptive wording,
+  while preserving genuine alphanumeric account suffixes.
 - COMBINED LABEL RULE: If the document uses a combined label such as
   "MASTER / SUB ACCOUNT NO." or "MASTER/SUB ACCOUNT NO" followed by a single
   account number, then BOTH master_account_number AND sub_account_number are
@@ -331,6 +369,12 @@ MISTAKE 8 — descriptive text captured together with the code:
 - Do NOT duplicate the master account number as the sub account unless the
   document explicitly repeats the same value for both fields OR uses a combined
   "MASTER / SUB" label.
+- COMBINED LABEL — If the column header is "Master/Sub account" or similar combined
+  label (no separate columns for master and sub), then BOTH master_account_number
+  AND sub_account_number are THE SAME value. Use the FIRST row's account value
+  for both fields. Other rows represent alternative or secondary accounts — ignore.
+- If multiple comma-separated values appear on master/sub account lines, take
+  the FIRST value only (before the first comma). Ignore any subsequent values.
 
 ================================================================================
 FIELD 5 — BANK NAME
@@ -419,29 +463,29 @@ STEP 1 — LOCATE THE FI CODE SECTION
   an adjacent line even though it is on the same line in the original document.
 
 STEP 2 — DETECT THE LAYOUT
-  Pipe characters (|) → Layout A: assign fi_num to the SHORTEST value in the row.
+  Pipe characters (|) → Layout A: assign fi_num to the 9-digit value in the row.
   Label lines (FI CODE :, MASTER ACCOUNT NO :) → Layout B: read each label's value.
   Repeated inline colons with label keywords on one line → Layout C.
   Lettered list (a) / b) / c)) → Layout D: each letter is a separate field;
       (b) master and (c) sub are DIFFERENT values from DIFFERENT lines.
   Account number listed first under "Account(s)", FI code on separate line below → Layout F:
-      both master and sub = the account number; fi_num = the shorter labelled value.
+      both master and sub = the account number; fi_num = the 9-digit labelled value.
   Combined "MASTER / SUB ACCOUNT NO." label with one value → both master and sub
       share that value; digit after "NO." is a footnote marker, not the sub account.
-  "CCRIS" prefix with comma-separated values → Layout E: fi_num starts with 0 or 3
-      (first value only per line).
+  "CCRIS" prefix with comma-separated values → Layout F (CCRIS variant): fi_num is
+      the 9-digit value starting with 0 or 3 (first value only per line).
   Header line ("FICode Master Act Number Sub Act.Number") followed by a bare
       values line with three space-separated numbers → Layout G: assign by digit
-      length: shortest=fi_num, longest=master, middle=sub.
+      count: 9-digit=fi_num, longest=master, remaining=sub.
 
 STEP 3 — ASSIGN THE THREE VALUES
-  fi_num                ← shortest value, starts with 0 or 3, usually 9-10 chars never shorter or longer than 9-10 chars
+  fi_num                ← the value with EXACTLY 9 digits starting with 0 or 3, else null
   master_account_number ← as described above for the detected layout
   sub_account_number    ← as described above for the detected layout (or null)
 
 STEP 4 — SANITY-CHECK
-  • fi_num starts with 0 or 3, is 9-10 characters and never longer or shorter than 9-10 characters.
-  • fi_num never starts with other number than 0 or 3.
+  • fi_num contains exactly 9 digits (ignoring one optional underscore/hyphen).
+  • fi_num starts with 0 or 3 and never with any other digit.
   • master_account_number ≠ fi_num.
   • In Layout D, confirm master_account_number came from the (b) "Master Account"
     line and sub_account_number came from the (c) "Sub Account" line — they are
@@ -451,11 +495,15 @@ STEP 4 — SANITY-CHECK
   • A combined "MASTER / SUB ACCOUNT NO." label means master = sub = that value.
     A digit like "2" immediately after "NO." is a footnote marker — not a value.
   • sub_account_number may equal master_account_number only when the document uses
-    a combined label or explicitly repeats the same value for both fields.
+    a combined label or combined column header (e.g. "Master /Sub account"),
+    or explicitly repeats the same value for both fields.
+  • Neither master_account_number nor sub_account_number equals fi_num.
   • None of these is a phone number, postcode, or RENTAS clearing account.
   • If a value had comma-separated candidates, confirm only the first (or the
     0/3-prefixed one for fi_num) was taken.
-  • Parenthetical text like "(Term Financing-i)" has been stripped.
+  • Neither master_account_number nor sub_account_number contains a bracket
+    "(" ")" "[" "]" or a descriptive word such as Term / Loan / Financing /
+    Overdraft / Housing / Facility. Trim it back to the account identifier.
 
 STEP 5 — FIND THE BANK NAME
   Check: signature block → RENTAS/IBG beneficiary label → letterhead near FI section.
@@ -469,27 +517,29 @@ STEP 7 — OUTPUT THE JSON.
 ================================================================================
 FINAL VALIDATION GATE — answer these before writing the JSON
 ================================================================================
-1. Is fi_num 9 or 10 characters? If longer or shorter → STOP, re-identify fi_num.
-2. Does fi_num start with 0 or 3? If starts with 1 or other numbers than 0 or 3 → STOP, 
-   take the other value that starts with 0 or 3.
-3. Is master_account_number or sub_account_number 9 or 10 characters and 
-   either start with 0 or 3? If yes → STOP, re-read.
+1. Remove any underscore/hyphen from fi_num and count the digits. Is the count
+   exactly 9? If it is 8, 10, 12, 14 or 26 → STOP. Look for a different 9-digit
+   candidate. If none exists anywhere in the document, set fi_num to null.
+2. Does fi_num start with 0 or 3? If it starts with any other digit → STOP,
+   take the value that starts with 0 or 3, or null if none exists.
+3. Is master_account_number identical to fi_num? If yes → STOP, re-read; they
+   are different fields. (A master account MAY legitimately be 9-10 digits and
+   MAY start with 0 or 3 — e.g. "3000170346" — that alone is not an error.)
 4. If the layout was D (lettered list): did master come from the (b) line and 
    sub come from the (c) line independently? If not → STOP, re-read.
 5. If the layout had a combined "MASTER / SUB ACCOUNT NO." label: are both 
    master AND sub set to the same single account value? If not → STOP, they are the same value.
 6. Is sub_account_number something other than a standalone digit like "2" or "1"?
    If it's a single digit → STOP, that is a footnote, re-read for the real sub.
-7. Is the RENTAS/IBG clearing account being used as master? If yes → STOP,
+7. Is the RENTAS/IBG clearing account being used as master? If yes → STOP, 
    use the value in the FI Code section instead.
-8. Does any of the three values contain a descriptive word or phrase (e.g.
-   "Term Loan", "Term Financing-i", "Housing Loan") attached to it? If yes →
-   STOP, remove the descriptive text and keep only the identifier itself.
-9. If the document shows a masked/redacted value (a run of "X" characters or
-   asterisks) for any of the three fields, did you copy it exactly as shown
-   instead of inventing a real-looking number or reusing a sample number from
-   these instructions? If you invented a number → STOP, replace it with the
-   masked value exactly as printed.
+8. Do master_account_number or sub_account_number contain a bracket or a
+   descriptive word (Term, Loan, Financing, Overdraft, Housing, Facility,
+   Account)? If yes → STOP, cut the value back to the account identifier only.
+   e.g. "7114160292-00000(Term Loan)" must become "7114160292-00000".
+9. Is sub_account_number equal to fi_num (ignoring brackets/punctuation)? If yes →
+   STOP. The FI code is never an account number. Use the combined-label rule
+   (sub = master) or the value under the "Sub Account" label.
 Only write the JSON after all 9 checks pass.
 ================================================================================
 
@@ -500,8 +550,8 @@ DO NOT EXPLAIN all the steps taken to extract the required field from the instru
 JUST RETURN ONLY this JSON object with no other text in the response:
 {{
     "name": "<full customer name or null>",
-    "master_account_number": "<master account number copied exactly as printed, or null>",
-    "sub_account_number": "<sub account number copied exactly as printed, or null>",
+    "master_account_number": "<master account number only — no brackets, no product/facility words — copied exactly as printed, or null>",
+    "sub_account_number": "<sub account number only — no brackets, no product/facility words — copied exactly as printed, or null>",
     "fi_num": "<FI number copied exactly as printed, or null>",
     "bank_name": "<canonical bank name from the known list, or null>"
 }}
