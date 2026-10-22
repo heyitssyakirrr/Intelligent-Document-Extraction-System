@@ -5,13 +5,20 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from app.core.config import get_settings
-from app.features.extraction.concurrency import _csv_append_lock
-from app.features.extraction.retention import (
+from FileReader.app.core.config import get_settings
+from FileReader.app.features.extraction.concurrency import _csv_append_lock
+from FileReader.app.features.extraction.retention import (
     enforce_dated_folder_retention,
     enforce_extractions_retention,
 )
-from app.models.schemas import ExtractionResult
+from FileReader.app.models.schemas import ExtractionResult
+from FileReader.app.services.db2_luw_client import (
+    append_filereader_row,
+    connect_db2,
+    connect_db2_gmsa,
+    kinit_from_keytab,
+)
+from FileReader.app.services.password_decryptor import decrypt_password
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -26,9 +33,9 @@ _OCR_OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
 
 _COLUMN_WIDTHS = {
     "timestamp": 20,
-    "filename": 18,
-    "bank_name": 35,
-    "fi_num": 11,
+    "filename": 35,
+    "bank_name": 60,
+    "fi_num": 30,
     "master_account_number": 30,
     "sub_account_number": 30,
 }
@@ -79,6 +86,39 @@ async def append_success_row(result: ExtractionResult, filename: str) -> Path:
         enforce_extractions_retention(_RESULTS_ROOT, settings.retention_max_days)
 
     logger.info("Success row written to %s for file '%s'", csv_path, filename)
+
+    if settings.db2_auth_mode == "gmsa":
+        if settings.db2_gmsa_keytab:
+            kinit_from_keytab(settings.db2_gmsa_keytab, settings.db2_gmsa_principal)
+        conn = connect_db2_gmsa(
+            database=settings.db2_database,
+            hostname=settings.db2_hostname,
+            port=settings.db2_port,
+        )
+    else:
+        pwd = decrypt_password(settings.db2_uid)
+        conn = connect_db2(
+            database=settings.db2_database,
+            hostname=settings.db2_hostname,
+            port=settings.db2_port,
+            uid=settings.db2_uid,
+            pwd=pwd
+        )
+
+    try:
+        append_filereader_row(
+            conn=conn,
+            filename=filename,
+            bankname=result.bank_name,
+            ficode=result.fi_num,
+            masteraccno=result.master_account_number,
+            subaccno=result.sub_account_number,
+        )
+    finally:
+        conn.close()
+
+    logger.info("Success row written to ELDS DB2 for file '%s'", filename)
+
     return csv_path
 
 
