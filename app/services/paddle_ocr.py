@@ -8,6 +8,8 @@ import logging
 import math
 from pathlib import Path
 
+from FileReader.app.core.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 _ocr_instance = None
@@ -186,80 +188,192 @@ def _extract_bbox_info(bbox_coords: list) -> tuple[float, float, float, float]:
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _group_text_by_rows(page_results: list, y_threshold: float = 15) -> list[list[tuple[float, str]]]:
-    """Group detected text elements into rows based on Y-coordinate similarity.
-    
-    Args:
-        page_results: PaddleOCR results for one page
-        y_threshold: Maximum Y difference (in pixels) to consider text on same row
-    
-    Returns:
-        List of rows, where each row is a list of (x_position, text) tuples sorted left-to-right.
-    """
-    # Collect all text with position info
-    text_elements: list[tuple[float, float, str]] = []
-    
+def _collect_text_elements(page_results: list) -> list[tuple[float, float, float, float, str]]:
+    """Return (min_y, max_y, min_x, max_x, text) for every detected text box."""
+    text_elements: list[tuple[float, float, float, float, str]] = []
+
     for line in page_results:
         if line is None or len(line) < 2:
             continue
-        
+
         bbox = line[0]
         text_info = line[1]
-        
+
         if bbox is None or text_info is None:
             continue
-        
+
         min_x, min_y, max_x, max_y = _extract_bbox_info(bbox)
         text = str(text_info[0]).strip()
-        
+
         if text:
-            # Use midpoint of Y coordinates as the row indicator
-            y_mid = (min_y + max_y) / 2
-            x_mid = (min_x + max_x) / 2
-            text_elements.append((y_mid, x_mid, text))
-    
+            text_elements.append((min_y, max_y, min_x, max_x, text))
+
+    return text_elements
+
+
+def _is_same_row_legacy(
+    min_y: float,
+    max_y: float,
+    row_min_y: float,
+    row_max_y: float,
+    y_threshold: float,
+) -> bool:
+    """Cells in one visual row overlap vertically even when their box heights differ."""
+    overlap = min(max_y, row_max_y) - max(min_y, row_min_y)
+    element_height = max(max_y - min_y, 1.0)
+    row_height = max(row_max_y - row_min_y, 1.0)
+    min_height = min(element_height, row_height)
+
+    if overlap >= 0.35 * min_height:
+        return True
+
+    element_mid = (min_y + max_y) / 2
+    row_mid = (row_min_y + row_max_y) / 2
+    return abs(element_mid - row_mid) <= max(y_threshold, 0.6 * min_height)
+
+
+def _group_text_by_rows_legacy(page_results: list, y_threshold: float = 15) -> list[list[tuple[float, float, str]]]:
+    """Group detected text elements into rows using vertical bounding-box overlap.
+
+    Args:
+        page_results: PaddleOCR results for one page
+        y_threshold: Fallback max Y-midpoint difference when box heights are unusable
+
+    Returns:
+        List of rows, where each row is a list of (min_x, max_x, text) tuples sorted left-to-right.
+    """
+    text_elements = _collect_text_elements(page_results)
     if not text_elements:
         return []
-    
-    # Sort by Y position to process rows top-to-bottom
-    text_elements.sort(key=lambda t: t[0])
-    
-    # Group into rows based on Y proximity
-    rows: list[list[tuple[float, str]]] = []
-    current_row: list[tuple[float, str]] = []
-    current_y = None
-    
-    for y_mid, x_mid, text in text_elements:
-        if current_y is None:
-            current_y = y_mid
-            current_row.append((x_mid, text))
-        elif abs(y_mid - current_y) <= y_threshold:
-            # Same row
-            current_row.append((x_mid, text))
-        else:
-            # New row detected
-            if current_row:
-                rows.append(current_row)
-            current_row = [(x_mid, text)]
-            current_y = y_mid
-    
-    # Add the last row
+
+    # Sort by top edge so rows are built top-to-bottom.
+    text_elements.sort(key=lambda t: (t[0], t[2]))
+
+    rows: list[list[tuple[float, float, str]]] = []
+    current_row: list[tuple[float, float, str]] = []
+    row_min_y = 0.0
+    row_max_y = 0.0
+
+    for min_y, max_y, min_x, max_x, text in text_elements:
+        if current_row and _is_same_row_legacy(min_y, max_y, row_min_y, row_max_y, y_threshold):
+            current_row.append((min_x, max_x, text))
+            row_min_y = min(row_min_y, min_y)
+            row_max_y = max(row_max_y, max_y)
+            continue
+
+        if current_row:
+            rows.append(current_row)
+        current_row = [(min_x, max_x, text)]
+        row_min_y, row_max_y = min_y, max_y
+
     if current_row:
         rows.append(current_row)
-    
+
     # Sort each row left-to-right by X coordinate
     for row in rows:
         row.sort(key=lambda t: t[0])
-    
+
     return rows
 
 
-def _format_markdown_row(row: list[tuple[float, str]]) -> str:
-    texts = [text.replace("|", "\\|").replace("\n", " ").strip() for _, text in row]
-    texts = [text for text in texts if text]
-    if len(texts) == 1:
-        return texts[0]
-    return f"| {' | '.join(texts)} |"
+def _row_band(row: list[tuple[float, float, float, float, str]]) -> tuple[float, float]:
+    """Median centre +/- half median height, so the band never grows as elements join."""
+    centres = sorted((e[0] + e[1]) / 2 for e in row)
+    heights = sorted(e[1] - e[0] for e in row)
+    centre = centres[len(centres) // 2]
+    half = max(heights[len(heights) // 2], 1.0) / 2
+    return centre - half, centre + half
+
+
+def _is_same_row_median(min_y: float, max_y: float, band_min: float, band_max: float) -> bool:
+    centre = (min_y + max_y) / 2
+    band_centre = (band_min + band_max) / 2
+    # Second condition keeps tall/spanning cells with their row.
+    return band_min <= centre <= band_max or min_y <= band_centre <= max_y
+
+
+def _group_text_by_rows_median(page_results: list) -> list[list[tuple[float, float, str]]]:
+    """Group text into rows by centre containment in a fixed-height band.
+
+    Unlike the legacy grouping, the band does not expand to the union of its
+    members, so padded boxes on consecutive lines cannot chain into one row.
+    """
+    text_elements = _collect_text_elements(page_results)
+    if not text_elements:
+        return []
+
+    text_elements.sort(key=lambda t: ((t[0] + t[1]) / 2, t[2]))
+
+    rows: list[list[tuple[float, float, float, float, str]]] = []
+    current: list[tuple[float, float, float, float, str]] = []
+
+    for element in text_elements:
+        if current and _is_same_row_median(element[0], element[1], *_row_band(current)):
+            current.append(element)
+            continue
+        if current:
+            rows.append(current)
+        current = [element]
+    if current:
+        rows.append(current)
+
+    return [
+        sorted(((e[2], e[3], e[4]) for e in row), key=lambda c: c[0])
+        for row in rows
+    ]
+
+
+def _group_text_by_rows(page_results: list) -> list[list[tuple[float, float, str]]]:
+    if get_settings().ocr_row_grouping == "median":
+        return _group_text_by_rows_median(page_results)
+    return _group_text_by_rows_legacy(page_results)
+
+
+def _column_gap_threshold(cells: list[tuple[float, float, str]]) -> float:
+    """Roughly 2.5 characters wide: column padding exceeds this, normal word spacing does not."""
+    total_width = sum(max_x - min_x for min_x, max_x, _ in cells)
+    total_chars = sum(len(text) for _, _, text in cells)
+    if total_width <= 0 or total_chars <= 0:
+        return float("inf")
+    return 2.5 * (total_width / total_chars)
+
+
+def _has_column_gap(cells: list[tuple[float, float, str]], threshold: float) -> bool:
+    return any(
+        cells[i + 1][0] - cells[i][1] >= threshold
+        for i in range(len(cells) - 1)
+    )
+
+
+def _leading_label_size(texts: list[str]) -> int:
+    """Number of leading cells that form a "Label :" caption, else 0."""
+    if len(texts) >= 3 and texts[1] == ":":
+        return 2
+    if texts[0].endswith(":"):
+        return 1
+    return 0
+
+
+def _format_markdown_row(row: list[tuple[float, float, str]]) -> str:
+    cells = [
+        (min_x, max_x, text.replace("|", "\\|").replace("\n", " ").strip())
+        for min_x, max_x, text in row
+    ]
+    cells = [cell for cell in cells if cell[2]]
+    if not cells:
+        return ""
+    if len(cells) == 1:
+        return cells[0][2]
+
+    label_size = _leading_label_size([cell[2] for cell in cells])
+    data_cells = cells[label_size:]
+
+    # Split off the caption only when the remaining cells are separated like real columns.
+    if label_size and len(data_cells) >= 2 and _has_column_gap(data_cells, _column_gap_threshold(cells)):
+        label = " ".join(cell[2] for cell in cells[:label_size])
+        return f"{label} | {' | '.join(cell[2] for cell in data_cells)} |"
+
+    return f"| {' | '.join(cell[2] for cell in cells)} |"
 
 
 def _format_page_as_markdown(results: list, page_num: int) -> str:
