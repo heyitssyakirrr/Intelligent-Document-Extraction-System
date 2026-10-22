@@ -5,8 +5,8 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from app.core.config import get_settings
-from app.features.extraction.context import FileProcessingContext
+from FileReader.app.core.config import get_settings
+from FileReader.app.features.extraction.context import FileProcessingContext
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -14,7 +14,7 @@ _summary_log_lock = asyncio.Lock()
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    return Path(__file__).resolve().parents[2]
 
 
 def _logs_root() -> Path:
@@ -41,9 +41,9 @@ def _total_duration_ms(ctx: FileProcessingContext) -> int | None:
 
 def build_file_summary(ctx: FileProcessingContext) -> str:
     # Total box width including the two │ wall characters.
-    W = 82
+    W = 88
     # Inner width = space available for content between the two walls.
-    INNER = W - 2  # 80 chars
+    INNER = W - 2  # 86 chars
 
     def wall(text: str = "") -> str:
         """Pad `text` to INNER chars and wrap it with │ walls."""
