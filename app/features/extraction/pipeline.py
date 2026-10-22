@@ -3,37 +3,34 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import tempfile
 import time
 from concurrent.futures import BrokenExecutor
 from datetime import datetime
 from pathlib import Path
 
-from app.core.config import get_settings
-from app.features.extraction.concurrency import (
+from FileReader.app.core.config import get_settings
+from FileReader.app.features.extraction.concurrency import (
     _llm_semaphore,
     _ocr_queue,
     _track_task,
     get_ocr_process_pool,
     reset_broken_ocr_pool,
 )
-from app.features.extraction.context import FileProcessingContext
-from app.features.extraction.lifecycle import (
+from FileReader.app.features.extraction.context import FileProcessingContext
+from FileReader.app.features.extraction.lifecycle import (
     mark_ocr_complete,
     mark_terminal,
     recover_orphaned_files,
     resume_interrupted_files,
 )
-from app.features.extraction.normalization import (
-    normalize_account_number,
-    normalize_fi_code,
-)
-from app.features.extraction.storage import append_failure_row, append_success_row, append_ocr_output
-from app.features.extraction.summary_logs import append_file_summary
-from app.features.prompt import build_extraction_prompt
-from app.models.schemas import ExtractionResult
-from app.services.llm_client import LLMClient
-from app.services.paddle_ocr import process_pdf
+from FileReader.app.features.extraction.storage import append_failure_row, append_success_row, append_ocr_output
+from FileReader.app.features.extraction.summary_logs import append_file_summary
+from FileReader.app.features.prompt import build_extraction_prompt
+from FileReader.app.models.schemas import ExtractionResult
+from FileReader.app.services.llm_client import LLMClient
+from FileReader.app.services.paddle_ocr import process_pdf
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -43,6 +40,17 @@ _llm_client = LLMClient()
 
 def _error_message(exc: Exception) -> str:
     return str(getattr(exc, "detail", None) or exc)
+
+
+def _validate_account_fields(result: ExtractionResult) -> None:
+    """Reject results where an account number is the FI code; the retry loop handles it."""
+    fi_num = result.fi_num
+    if not fi_num:
+        return
+    for field in ("master_account_number", "sub_account_number"):
+        value = getattr(result, field)
+        if value and re.sub(r"[^0-9A-Za-z]", "", value) == fi_num:
+            raise ValueError(f"{field} equals fi_num ({fi_num})")
 
 
 async def _record_failure(
@@ -97,9 +105,6 @@ async def _run_ocr(ctx: FileProcessingContext, pdf_bytes: bytes) -> str:
                 timeout=settings.ocr_timeout_seconds,
             )
         except BrokenExecutor:
-            # The OCR worker process died mid-job (e.g. native crash on a
-            # malformed PDF). Without this, every file after it would fail
-            # forever since the pool is permanently dead.
             logger.error(
                 "OCR worker process crashed while processing '%s' (run=%s).",
                 ctx.filename, ctx.processing_timestamp,
@@ -112,7 +117,9 @@ async def _run_ocr(ctx: FileProcessingContext, pdf_bytes: bytes) -> str:
         ctx.ocr_status = "completed"
         logger.debug(
             "OCR completed for '%s' (run=%s): %d characters extracted",
-            ctx.filename, ctx.processing_timestamp, len(text),
+            ctx.filename,
+            ctx.processing_timestamp,
+            len(text),
         )
         return text
 
@@ -146,9 +153,9 @@ async def _run_llm_extraction(ctx: FileProcessingContext, ocr_text: str) -> Extr
 
     return ExtractionResult(
         name=llm_result.get("name"),
-        master_account_number=normalize_account_number(llm_result.get("master_account_number")),
-        sub_account_number=normalize_account_number(llm_result.get("sub_account_number")),
-        fi_num=normalize_fi_code(llm_result.get("fi_num")),
+        master_account_number=llm_result.get("master_account_number"),
+        sub_account_number=llm_result.get("sub_account_number"),
+        fi_num=llm_result.get("fi_num"),
         bank_name=llm_result.get("bank_name"),
     )
 
@@ -221,6 +228,7 @@ async def _llm_stage_inner(ctx: FileProcessingContext, ocr_text: str, pdf_bytes:
             )
             try:
                 result = await _run_llm_extraction(ctx, ocr_text)
+                _validate_account_fields(result)
             except Exception as exc:
                 last_exc = exc
                 ctx.llm_last_error_type = type(exc).__name__
